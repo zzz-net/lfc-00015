@@ -151,11 +151,11 @@ class PipelineService:
 
     # ========== 处理流程 ==========
 
-    def process_batch(self, batch_id: int, force: bool = False) -> Tuple[int, int]:
+    def process_batch(self, batch_id: int) -> Tuple[int, int]:
         """
         处理批次。
-        - 若批次锁定且非 force: 抛出 BatchLockedError
-        - 创建新的运行记录（run_number 递增）
+        - 若批次已锁定: 无条件抛出 BatchLockedError，不会产生新 run
+        - 未锁定批次: 创建新的运行记录（run_number 递增）
         - 返回 (run_id, run_number)
         """
         conn = self._conn()
@@ -164,9 +164,11 @@ class PipelineService:
             if not batch:
                 raise BatchServiceError(f"批次不存在: {batch_id}")
 
-            if db.is_batch_locked(conn, batch_id) and not force:
+            if db.is_batch_locked(conn, batch_id):
                 raise BatchLockedError(
-                    f"批次 {batch_id} 已锁定，禁止重跑。如需强制重跑请使用 --force 参数。"
+                    f"批次 {batch_id} 已锁定，禁止重跑或产生新运行记录。"
+                    f"历史结果受保护，默认导出始终指向锁定时的最新 run。"
+                    f"如需修改，请先执行 unlock 解锁。"
                 )
 
             config = json.loads(batch["config_json"])
@@ -271,7 +273,12 @@ class PipelineService:
                 latest = db.get_latest_run(conn, batch_id)
                 if not latest:
                     raise BatchServiceError(f"批次 {batch_id} 尚未运行")
+                target_run = latest
                 run_id = latest["id"]
+            else:
+                target_run = db.get_run(conn, run_id)
+                if not target_run or target_run["batch_id"] != batch_id:
+                    raise BatchServiceError(f"运行 {run_id} 不存在或不属于批次 {batch_id}")
 
             metrics = db.get_metrics(conn, run_id)
             if not metrics:
@@ -282,6 +289,8 @@ class PipelineService:
                 "batch_id": batch_id,
                 "batch_name": batch["name"],
                 "run_id": run_id,
+                "run_number": target_run["run_number"],
+                "config_version": target_run["config_version"],
                 "sensor": m["sensor_name"],
                 "metric": m["metric_name"],
                 "value": m["metric_value"]
@@ -305,7 +314,12 @@ class PipelineService:
                 latest = db.get_latest_run(conn, batch_id)
                 if not latest:
                     raise BatchServiceError(f"批次 {batch_id} 尚未运行")
+                target_run = latest
                 run_id = latest["id"]
+            else:
+                target_run = db.get_run(conn, run_id)
+                if not target_run or target_run["batch_id"] != batch_id:
+                    raise BatchServiceError(f"运行 {run_id} 不存在或不属于批次 {batch_id}")
 
             errors = db.get_row_errors(conn, run_id)
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -314,6 +328,8 @@ class PipelineService:
                     "batch_id": batch_id,
                     "batch_name": batch["name"],
                     "run_id": run_id,
+                    "run_number": target_run["run_number"],
+                    "config_version": target_run["config_version"],
                     "row_number": e["row_number"],
                     "error_type": e["error_type"],
                     "error_detail": e["error_detail"],
@@ -322,7 +338,7 @@ class PipelineService:
                 df.to_csv(output_path, index=False, encoding="utf-8-sig")
             else:
                 with open(output_path, "w", encoding="utf-8-sig") as f:
-                    f.write("batch_id,batch_name,run_id,row_number,error_type,error_detail,raw_data\n")
+                    f.write("batch_id,batch_name,run_id,run_number,config_version,row_number,error_type,error_detail,raw_data\n")
 
             db.add_export(conn, batch_id, run_id, os.path.abspath(output_path), "errors")
             return os.path.abspath(output_path)
@@ -341,7 +357,12 @@ class PipelineService:
                 latest = db.get_latest_run(conn, batch_id)
                 if not latest:
                     raise BatchServiceError(f"批次 {batch_id} 尚未运行")
+                target_run = latest
                 run_id = latest["id"]
+            else:
+                target_run = db.get_run(conn, run_id)
+                if not target_run or target_run["batch_id"] != batch_id:
+                    raise BatchServiceError(f"运行 {run_id} 不存在或不属于批次 {batch_id}")
 
             anomalies = db.get_anomalies(conn, run_id)
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -350,6 +371,8 @@ class PipelineService:
                     "batch_id": batch_id,
                     "batch_name": batch["name"],
                     "run_id": run_id,
+                    "run_number": target_run["run_number"],
+                    "config_version": target_run["config_version"],
                     "sensor": a["sensor_name"],
                     "row_number": a["row_number"],
                     "timestamp": a["timestamp"],
@@ -359,7 +382,7 @@ class PipelineService:
                 df.to_csv(output_path, index=False, encoding="utf-8-sig")
             else:
                 with open(output_path, "w", encoding="utf-8-sig") as f:
-                    f.write("batch_id,batch_name,run_id,sensor,row_number,timestamp,value,anomaly_type\n")
+                    f.write("batch_id,batch_name,run_id,run_number,config_version,sensor,row_number,timestamp,value,anomaly_type\n")
 
             db.add_export(conn, batch_id, run_id, os.path.abspath(output_path), "anomalies")
             return os.path.abspath(output_path)

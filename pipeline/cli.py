@@ -105,13 +105,12 @@ def show_batch(ctx, batch_id):
 
 @cli.command("process")
 @click.argument("batch_id", type=int)
-@click.option("--force", is_flag=True, help="即使锁定也强制重跑")
 @click.pass_context
-def process_batch(ctx, batch_id, force):
-    """处理批次 / 重跑（未锁定自动创建新运行记录）"""
+def process_batch(ctx, batch_id):
+    """处理批次 / 重跑。未锁定批次创建新运行记录；锁定批次拒绝执行。"""
     svc = _get_service(ctx.obj.get("db_path"))
     try:
-        run_id, run_number = svc.process_batch(batch_id, force=force)
+        run_id, run_number = svc.process_batch(batch_id)
         click.echo(f"{OK} 批次 {batch_id} 处理完成")
         click.echo(f"  运行 ID: {run_id}")
         click.echo(f"  运行次数: #{run_number}")
