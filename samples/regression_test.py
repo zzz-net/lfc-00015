@@ -531,6 +531,193 @@ def run_tests():
             r12.fail(str(e))
             print(f"  [FAIL] {r12.name}: {e}")
 
+        # ====== 测试 13: scheme save 日志输出（级别+内容+时机） ======
+        r13 = TestResult("测试13: scheme save 输出 INFO 日志，含方案名和批次标识")
+        results.append(r13)
+        try:
+            import logging
+
+            svc_log1 = PipelineService(db_path)
+
+            test_batch = svc_log1.create_batch("logtest_batch_save", SAMPLE_CSV)
+            svc_log1.process_batch(test_batch)
+
+            log_records = []
+            class _CaptureHandler(logging.Handler):
+                def emit(self, record):
+                    log_records.append(record)
+
+            handler = _CaptureHandler()
+            handler.setLevel(logging.DEBUG)
+            svc_logger = logging.getLogger("pipeline.service")
+            original_level = svc_logger.level
+            svc_logger.addHandler(handler)
+            svc_logger.setLevel(logging.INFO)
+
+            try:
+                scheme_name = "logtest_scheme_save"
+                sid = svc_log1.save_scheme(scheme_name, batch_id=test_batch, description="日志测试")
+
+                save_logs = [r for r in log_records if "方案" in r.getMessage() or "scheme" in r.getMessage().lower()]
+                assert len(save_logs) >= 1, f"save_scheme 应产生至少 1 条方案相关日志，实际 {len(save_logs)} 条"
+
+                save_record = save_logs[-1]
+                assert save_record.levelno == logging.INFO, \
+                    f"日志级别应为 INFO，实际 {logging.getLevelName(save_record.levelno)}"
+
+                msg = save_record.getMessage()
+                assert scheme_name in msg, f"日志应包含方案名 '{scheme_name}'，实际: {msg}"
+                assert str(test_batch) in msg or "batch_id" in msg, \
+                    f"日志应包含批次标识，实际: {msg}"
+                assert str(sid) in msg, f"日志应包含方案 ID，实际: {msg}"
+
+                assert "pipeline.service" in save_record.name, \
+                    f"日志来源应为 pipeline.service，实际 {save_record.name}"
+            finally:
+                svc_logger.removeHandler(handler)
+                svc_logger.setLevel(original_level)
+
+            r13.ok()
+            print(f"  [PASS] {r13.name}  (scheme_id={sid}, log_level=INFO)")
+        except Exception as e:
+            r13.fail(str(e))
+            print(f"  [FAIL] {r13.name}: {e}")
+
+        # ====== 测试 14: scheme import 日志输出（新导入/覆盖/重命名/跳过均有对应日志） ======
+        r14 = TestResult("测试14: scheme import 各分支输出对应 INFO 日志，含文件名和方案名")
+        results.append(r14)
+        try:
+            import logging
+
+            svc_log2 = PipelineService(db_path)
+
+            schemes_dir = os.path.join(tmpdir, "logtest_schemes")
+            os.makedirs(schemes_dir, exist_ok=True)
+
+            base_scheme_path = os.path.join(schemes_dir, "base_logtest.json")
+            svc_log2.export_scheme_to_file(sid, base_scheme_path)
+
+            log_records = []
+            class _CaptureHandler(logging.Handler):
+                def emit(self, record):
+                    log_records.append(record)
+
+            handler = _CaptureHandler()
+            handler.setLevel(logging.DEBUG)
+            svc_logger = logging.getLogger("pipeline.service")
+            original_level = svc_logger.level
+            svc_logger.addHandler(handler)
+            svc_logger.setLevel(logging.INFO)
+
+            try:
+                fresh_path = os.path.join(schemes_dir, "fresh.json")
+                with open(base_scheme_path, "r", encoding="utf-8") as f:
+                    fresh_data = json.load(f)
+                fresh_data["name"] = "logtest_fresh_import"
+                with open(fresh_path, "w", encoding="utf-8") as f:
+                    json.dump(fresh_data, f, ensure_ascii=False)
+
+                before_count = len(log_records)
+                res_fresh = svc_log2.import_scheme_from_file(fresh_path)
+                assert res_fresh.success
+                fresh_logs = log_records[before_count:]
+                assert len(fresh_logs) >= 1, "新导入应产生至少 1 条日志"
+                assert fresh_logs[-1].levelno == logging.INFO
+                assert "导入" in fresh_logs[-1].getMessage()
+                assert "logtest_fresh_import" in fresh_logs[-1].getMessage()
+
+                before_count = len(log_records)
+                res_over = svc_log2.import_scheme_from_file(
+                    fresh_path, on_conflict=SchemeImportResult.ACTION_OVERWRITE)
+                assert res_over.success
+                over_logs = log_records[before_count:]
+                assert len(over_logs) >= 1, "覆盖导入应产生至少 1 条日志"
+                assert over_logs[-1].levelno == logging.INFO
+                assert "覆盖" in over_logs[-1].getMessage()
+
+                before_count = len(log_records)
+                res_rename = svc_log2.import_scheme_from_file(
+                    fresh_path, on_conflict=SchemeImportResult.ACTION_RENAME)
+                assert res_rename.success
+                rename_logs = log_records[before_count:]
+                assert len(rename_logs) >= 1, "重命名导入应产生至少 1 条日志"
+                assert rename_logs[-1].levelno == logging.INFO
+                assert "重命名" in rename_logs[-1].getMessage()
+
+                before_count = len(log_records)
+                res_skip = svc_log2.import_scheme_from_file(
+                    fresh_path, on_conflict=SchemeImportResult.ACTION_SKIP)
+                assert not res_skip.success
+                skip_logs = log_records[before_count:]
+                assert len(skip_logs) >= 1, "跳过导入应产生至少 1 条日志"
+                assert skip_logs[-1].levelno == logging.INFO
+                assert "跳过" in skip_logs[-1].getMessage()
+            finally:
+                svc_logger.removeHandler(handler)
+                svc_logger.setLevel(original_level)
+
+            r14.ok()
+            print(f"  [PASS] {r14.name}  (fresh/overwrite/rename/skip 四分支均有 INFO 日志)")
+        except Exception as e:
+            r14.fail(str(e))
+            print(f"  [FAIL] {r14.name}: {e}")
+
+        # ====== 测试 15: compare run 日志输出（含报告名、方案名、批次列表） ======
+        r15 = TestResult("测试15: compare run 输出 INFO 日志，含报告名、方案名、批次标识")
+        results.append(r15)
+        try:
+            import logging
+
+            svc_log3 = PipelineService(db_path)
+
+            batch_a = svc_log3.create_batch("logtest_cmp_a", SAMPLE_CSV)
+            svc_log3.process_batch(batch_a)
+            batch_b = svc_log3.create_batch("logtest_cmp_b", SAMPLE_CSV)
+            svc_log3.set_threshold(batch_b, zscore_threshold=1.2)
+            svc_log3.process_batch(batch_b)
+
+            log_records = []
+            class _CaptureHandler(logging.Handler):
+                def emit(self, record):
+                    log_records.append(record)
+
+            handler = _CaptureHandler()
+            handler.setLevel(logging.DEBUG)
+            svc_logger = logging.getLogger("pipeline.service")
+            original_level = svc_logger.level
+            svc_logger.addHandler(handler)
+            svc_logger.setLevel(logging.INFO)
+
+            try:
+                report_name = "logtest_compare_report"
+                report = svc_log3.generate_comparison_report(
+                    report_name, [batch_a, batch_b], scheme_id=sid)
+
+                cmp_logs = [r for r in log_records if "对比" in r.getMessage() or "compare" in r.getMessage().lower() or "报告" in r.getMessage()]
+                assert len(cmp_logs) >= 1, f"generate_comparison_report 应产生至少 1 条报告相关日志，实际 {len(cmp_logs)} 条"
+
+                cmp_record = cmp_logs[-1]
+                assert cmp_record.levelno == logging.INFO, \
+                    f"日志级别应为 INFO，实际 {logging.getLevelName(cmp_record.levelno)}"
+
+                msg = cmp_record.getMessage()
+                assert report_name in msg, f"日志应包含报告名 '{report_name}'，实际: {msg}"
+                assert str(sid) in msg or "scheme" in msg.lower(), \
+                    f"日志应包含方案标识，实际: {msg}"
+                assert str(batch_a) in msg and str(batch_b) in msg, \
+                    f"日志应包含所有参与批次 ID，实际: {msg}"
+                assert str(report["report_id"]) in msg, \
+                    f"日志应包含报告 ID，实际: {msg}"
+            finally:
+                svc_logger.removeHandler(handler)
+                svc_logger.setLevel(original_level)
+
+            r15.ok()
+            print(f"  [PASS] {r15.name}  (report_id={report['report_id']}, log_level=INFO)")
+        except Exception as e:
+            r15.fail(str(e))
+            print(f"  [FAIL] {r15.name}: {e}")
+
         # ====== 汇总 ======
         print()
         total = len(results)

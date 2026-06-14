@@ -627,9 +627,11 @@ class PipelineService:
                     )
                 elif on_conflict == SchemeImportResult.ACTION_OVERWRITE:
                     db.update_scheme(conn, existing["id"], config, description)
-                    return SchemeImportResult(True, existing["id"],
-                                              SchemeImportResult.ACTION_OVERWRITE,
-                                              f"已覆盖方案 '{name}'")
+                    result = SchemeImportResult(True, existing["id"],
+                                                SchemeImportResult.ACTION_OVERWRITE,
+                                                f"已覆盖方案 '{name}'")
+                    logger.info(f"方案导入(覆盖): file='{file_path}', scheme_id={existing['id']}, name='{name}'")
+                    return result
                 elif on_conflict == SchemeImportResult.ACTION_RENAME:
                     final_name = new_name or f"{name}_imported"
                     counter = 1
@@ -637,11 +639,15 @@ class PipelineService:
                         final_name = f"{name}_imported_{counter}"
                         counter += 1
                     sid = db.create_scheme(conn, final_name, config, description)
-                    return SchemeImportResult(True, sid, SchemeImportResult.ACTION_RENAME,
-                                              f"已重命名导入: '{final_name}'")
+                    result = SchemeImportResult(True, sid, SchemeImportResult.ACTION_RENAME,
+                                                f"已重命名导入: '{final_name}'")
+                    logger.info(f"方案导入(重命名): file='{file_path}', scheme_id={sid}, original='{name}', final='{final_name}'")
+                    return result
                 elif on_conflict == SchemeImportResult.ACTION_SKIP:
-                    return SchemeImportResult(False, None, SchemeImportResult.ACTION_SKIP,
-                                              f"已跳过同名方案 '{name}'")
+                    result = SchemeImportResult(False, None, SchemeImportResult.ACTION_SKIP,
+                                                f"已跳过同名方案 '{name}'")
+                    logger.info(f"方案导入(跳过): file='{file_path}', name='{name}' (已存在同名方案)")
+                    return result
                 else:
                     raise SchemeError(f"未知冲突处理策略: {on_conflict}")
             else:
