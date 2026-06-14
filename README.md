@@ -86,6 +86,8 @@ python -m pipeline scheme --help
 | `scheme list` | 列出所有方案 |
 | `scheme show SCHEME_ID` | 显示方案详情 |
 | `scheme apply SCHEME_ID BATCH_ID` | 将方案应用到未锁定批次（不自动重跑） |
+| `scheme clone SOURCE_SCHEME_ID NEW_NAME [--description TEXT]` | 基于已有方案克隆出新方案，可改名称和描述 |
+| `scheme clone-apply SOURCE_SCHEME_ID NEW_NAME BATCH_ID [--description TEXT]` | 克隆方案并立即应用到未锁定批次（不自动重跑） |
 | `scheme export SCHEME_ID -o FILE.json` | 导出方案为 JSON 文件 |
 | `scheme import FILE.json [--on-conflict ask\|overwrite\|rename\|skip] [--new-name NAME]` | 从文件导入方案 |
 | `scheme delete SCHEME_ID` | 删除方案 |

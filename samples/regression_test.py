@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.service import (
     PipelineService, BatchLockedError, BatchServiceError,
-    SchemeError, SchemeConflictError, SchemeImportResult
+    SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult
 )
 from pipeline import database as db
 from pipeline.processor import import_csv
@@ -717,6 +717,264 @@ def run_tests():
         except Exception as e:
             r15.fail(str(e))
             print(f"  [FAIL] {r15.name}: {e}")
+
+        # ====== 测试 16: 方案克隆（仅克隆）成功 + 同名冲突 ======
+        r16 = TestResult("测试16: 方案 clone 成功克隆，同名时抛出 name_exists 冲突")
+        results.append(r16)
+        try:
+            svc_clone1 = PipelineService(db_path)
+
+            base_sid = svc_clone1.save_scheme(
+                "clone_base_v1", batch_id=batch_id, description="克隆源方案")
+
+            cloned_sid = svc_clone1.clone_scheme(base_sid, "clone_base_v1_copy", "克隆副本描述")
+            assert cloned_sid > base_sid, "克隆方案 ID 应大于源方案"
+
+            cloned = svc_clone1.get_scheme(cloned_sid)
+            assert cloned["name"] == "clone_base_v1_copy"
+            assert cloned["description"] == "克隆副本描述"
+            assert cloned["scheme_version"] == svc_clone1.get_scheme(base_sid)["scheme_version"]
+            assert json.dumps(cloned["config"], sort_keys=True) == \
+                   json.dumps(svc_clone1.get_scheme(base_sid)["config"], sort_keys=True), \
+                   "克隆配置应与源方案完全一致"
+
+            try:
+                svc_clone1.clone_scheme(base_sid, "clone_base_v1_copy")
+                assert False, "同名克隆应抛出 SchemeConflictError"
+            except SchemeConflictError as sce:
+                assert sce.conflict_type == SchemeConflictError.CONFLICT_NAME
+                assert sce.details.get("existing_scheme_id") == cloned_sid
+                assert sce.details.get("source_scheme_id") == base_sid
+                assert sce.details.get("source_scheme_name") == "clone_base_v1"
+
+            schemes_list = svc_clone1.list_schemes()
+            found_cloned = any(s["id"] == cloned_sid for s in schemes_list)
+            assert found_cloned, "list_schemes 应包含克隆出的方案"
+
+            r16.ok()
+            print(f"  [PASS] {r16.name}  (base_sid={base_sid}, cloned_sid={cloned_sid})")
+        except Exception as e:
+            r16.fail(str(e))
+            print(f"  [FAIL] {r16.name}: {e}")
+
+        # ====== 测试 17: 克隆并应用链路 - 成功、同名冲突、锁定批次拒绝 ======
+        r17 = TestResult("测试17: clone-and-apply 成功克隆应用、同名冲突、锁定批次拒绝")
+        results.append(r17)
+        try:
+            svc_clone2 = PipelineService(db_path)
+
+            second_bid = svc_clone2.create_batch("clone_apply_batch", SAMPLE_CSV)
+            svc_clone2.process_batch(second_bid)
+
+            base_scheme = svc_clone2.save_scheme(
+                "clone_apply_base", batch_id=batch_id, description="克隆应用源方案")
+
+            result = svc_clone2.clone_and_apply_scheme(
+                base_scheme, "clone_apply_new", second_bid, "链路测试方案")
+            assert isinstance(result, SchemeCloneResult)
+            assert result.success is True
+            assert result.source_scheme_id == base_scheme
+            assert result.source_scheme_name == "clone_apply_base"
+            assert result.cloned_scheme_id > base_scheme
+            assert result.cloned_scheme_name == "clone_apply_new"
+            assert result.applied_batch_id == second_bid
+            assert result.new_config_version > 1
+
+            second_batch = svc_clone2.get_batch(second_bid)
+            assert second_batch["config_version"] == result.new_config_version, \
+                f"批次配置版本应升至 v{result.new_config_version}, 实际 v{second_batch['config_version']}"
+
+            applied_scheme = svc_clone2.get_scheme(result.cloned_scheme_id)
+            assert applied_scheme is not None
+            assert applied_scheme["name"] == "clone_apply_new"
+
+            try:
+                svc_clone2.clone_and_apply_scheme(base_scheme, "clone_apply_new", second_bid)
+                assert False, "同名 clone-and-apply 应抛出 SchemeConflictError"
+            except SchemeConflictError as sce:
+                assert sce.conflict_type == SchemeConflictError.CONFLICT_NAME
+                assert sce.details.get("existing_scheme_id") == result.cloned_scheme_id
+
+            svc_clone2.lock_batch(second_bid)
+            try:
+                svc_clone2.clone_and_apply_scheme(base_scheme, "clone_apply_another", second_bid)
+                assert False, "锁定批次 clone-and-apply 应抛出 BatchLockedError"
+            except BatchLockedError:
+                pass
+
+            svc_clone2.unlock_batch(second_bid)
+
+            r17.ok()
+            print(f"  [PASS] {r17.name}  (cloned_sid={result.cloned_scheme_id}, "
+                  f"batch={second_bid}, new_cfg_v={result.new_config_version})")
+        except Exception as e:
+            r17.fail(str(e))
+            print(f"  [FAIL] {r17.name}: {e}")
+
+        # ====== 测试 18: 克隆后重启查询 - 方案和配置版本持久化 ======
+        r18 = TestResult("测试18: 重启后克隆方案仍可查询，应用后的配置版本保留")
+        results.append(r18)
+        try:
+            svc_pre = PipelineService(db_path)
+            pre_sid = svc_pre.clone_scheme(sid, "restart_cloned_scheme", "重启前克隆")
+            pre_batch_id = svc_pre.create_batch("restart_clone_batch", SAMPLE_CSV)
+            svc_pre.process_batch(pre_batch_id)
+            pre_result = svc_pre.clone_and_apply_scheme(
+                pre_sid, "restart_clone_apply", pre_batch_id, "重启前克隆并应用")
+            expected_cfg_v = pre_result.new_config_version
+
+            del svc_pre
+
+            svc_post = PipelineService(db_path)
+
+            cloned_after = svc_post.get_scheme(pre_sid)
+            assert cloned_after is not None, "重启后克隆方案应存在"
+            assert cloned_after["id"] == pre_sid
+            assert cloned_after["name"] == "restart_cloned_scheme"
+            assert cloned_after["description"] == "重启前克隆"
+
+            list_after = svc_post.list_schemes()
+            assert any(s["id"] == pre_sid for s in list_after), "list_schemes 应包含重启前克隆的方案"
+
+            applied_scheme_after = svc_post.get_scheme(pre_result.cloned_scheme_id)
+            assert applied_scheme_after is not None
+            assert applied_scheme_after["name"] == "restart_clone_apply"
+
+            batch_after = svc_post.get_batch(pre_batch_id)
+            assert batch_after["config_version"] == expected_cfg_v, \
+                f"重启后批次配置版本应仍为 v{expected_cfg_v}, 实际 v{batch_after['config_version']}"
+
+            r18.ok()
+            print(f"  [PASS] {r18.name}  (cloned_sid={pre_sid}, batch_cfg_v={expected_cfg_v})")
+        except Exception as e:
+            r18.fail(str(e))
+            print(f"  [FAIL] {r18.name}: {e}")
+
+        # ====== 测试 19: 克隆方案与导出/导入兼容性 ======
+        r19 = TestResult("测试19: 克隆方案可正常导出并再导入，配置一致")
+        results.append(r19)
+        try:
+            svc_cmp = PipelineService(db_path)
+
+            compat_sid = svc_cmp.clone_scheme(sid, "compat_clone_source", "兼容性测试源")
+
+            export_dir = os.path.join(tmpdir, "compat_exports")
+            os.makedirs(export_dir, exist_ok=True)
+            export_path = os.path.join(export_dir, "compat_clone.json")
+            svc_cmp.export_scheme_to_file(compat_sid, export_path)
+            assert os.path.exists(export_path)
+
+            import_result = svc_cmp.import_scheme_from_file(
+                export_path, on_conflict=SchemeImportResult.ACTION_RENAME,
+                new_name="compat_clone_imported")
+            assert import_result.success
+            assert import_result.action == SchemeImportResult.ACTION_RENAME
+
+            imported_scheme = svc_cmp.get_scheme(import_result.scheme_id)
+            original_cloned = svc_cmp.get_scheme(compat_sid)
+            assert imported_scheme["name"] == "compat_clone_imported"
+            assert json.dumps(imported_scheme["config"], sort_keys=True) == \
+                   json.dumps(original_cloned["config"], sort_keys=True), \
+                   "导出再导入后配置应完全一致"
+            assert imported_scheme["scheme_version"] == original_cloned["scheme_version"]
+
+            r19.ok()
+            print(f"  [PASS] {r19.name}  (exported={export_path}, imported_id={import_result.scheme_id})")
+        except Exception as e:
+            r19.fail(str(e))
+            print(f"  [FAIL] {r19.name}: {e}")
+
+        # ====== 测试 20: 克隆和克隆应用日志输出 ======
+        r20 = TestResult("测试20: clone 和 clone-and-apply 输出 INFO 日志，含源/目标方案和批次")
+        results.append(r20)
+        try:
+            import logging
+
+            svc_log4 = PipelineService(db_path)
+
+            log_sid = svc_log4.save_scheme("log_clone_source", batch_id=batch_id)
+            log_batch = svc_log4.create_batch("log_clone_apply_batch", SAMPLE_CSV)
+            svc_log4.process_batch(log_batch)
+
+            log_records = []
+
+            class _CaptureHandler(logging.Handler):
+                def emit(self, record):
+                    log_records.append(record)
+
+            handler = _CaptureHandler()
+            handler.setLevel(logging.DEBUG)
+            svc_logger = logging.getLogger("pipeline.service")
+            original_level = svc_logger.level
+            svc_logger.addHandler(handler)
+            svc_logger.setLevel(logging.INFO)
+
+            try:
+                before_count = len(log_records)
+                cloned_log_sid = svc_log4.clone_scheme(log_sid, "log_clone_target", "日志测试克隆")
+                clone_logs = log_records[before_count:]
+                assert len(clone_logs) >= 1, "clone_scheme 应至少产生 1 条日志"
+                assert clone_logs[-1].levelno == logging.INFO
+                clone_msg = clone_logs[-1].getMessage()
+                assert str(log_sid) in clone_msg, f"克隆日志应含源方案 ID，实际: {clone_msg}"
+                assert "log_clone_source" in clone_msg, f"克隆日志应含源方案名，实际: {clone_msg}"
+                assert str(cloned_log_sid) in clone_msg, f"克隆日志应含新方案 ID，实际: {clone_msg}"
+                assert "log_clone_target" in clone_msg, f"克隆日志应含新方案名，实际: {clone_msg}"
+
+                before_count = len(log_records)
+                result = svc_log4.clone_and_apply_scheme(
+                    log_sid, "log_clone_apply_target", log_batch, "日志测试链路")
+                apply_logs = log_records[before_count:]
+                assert len(apply_logs) >= 2, f"clone_and_apply 应至少产生 2 条日志（克隆+应用），实际 {len(apply_logs)}"
+                clone_apply_msgs = [r.getMessage() for r in apply_logs if r.levelno == logging.INFO]
+                assert any("克隆" in m for m in clone_apply_msgs), "链路日志应含克隆相关记录"
+                assert any("应用" in m for m in clone_apply_msgs), "链路日志应含应用相关记录"
+                joined = " | ".join(clone_apply_msgs)
+                assert str(log_sid) in joined, f"链路日志应含源方案 ID，实际: {joined}"
+                assert str(result.cloned_scheme_id) in joined, f"链路日志应含新方案 ID，实际: {joined}"
+                assert str(log_batch) in joined, f"链路日志应含批次 ID，实际: {joined}"
+
+            finally:
+                svc_logger.removeHandler(handler)
+                svc_logger.setLevel(original_level)
+
+            r20.ok()
+            print(f"  [PASS] {r20.name}  (clone_logs={len(clone_logs)}, apply_logs={len(apply_logs)})")
+        except Exception as e:
+            r20.fail(str(e))
+            print(f"  [FAIL] {r20.name}: {e}")
+
+        # ====== 测试 21: CLI scheme clone / clone-apply 帮助文本完整性 ======
+        r21 = TestResult("测试21: CLI scheme clone/clone-apply 帮助文本完整")
+        results.append(r21)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+
+            runner = CliRunner()
+
+            res_scheme_help = runner.invoke(cli, ["scheme", "--help"])
+            assert res_scheme_help.exit_code == 0
+            assert "clone" in res_scheme_help.output, "scheme --help 应包含 clone"
+            assert "clone-apply" in res_scheme_help.output, "scheme --help 应包含 clone-apply"
+
+            res_clone_help = runner.invoke(cli, ["scheme", "clone", "--help"])
+            assert res_clone_help.exit_code == 0
+            assert "source_scheme_id" in res_clone_help.output or "SOURCE_SCHEME_ID" in res_clone_help.output
+            assert "new_name" in res_clone_help.output or "NEW_NAME" in res_clone_help.output
+            assert "description" in res_clone_help.output
+
+            res_clone_apply_help = runner.invoke(cli, ["scheme", "clone-apply", "--help"])
+            assert res_clone_apply_help.exit_code == 0
+            assert "source_scheme_id" in res_clone_apply_help.output or "SOURCE_SCHEME_ID" in res_clone_apply_help.output
+            assert "new_name" in res_clone_apply_help.output or "NEW_NAME" in res_clone_apply_help.output
+            assert "batch_id" in res_clone_apply_help.output or "BATCH_ID" in res_clone_apply_help.output
+
+            r21.ok()
+            print(f"  [PASS] {r21.name}")
+        except Exception as e:
+            r21.fail(str(e))
+            print(f"  [FAIL] {r21.name}: {e}")
 
         # ====== 汇总 ======
         print()

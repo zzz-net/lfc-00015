@@ -63,6 +63,22 @@ class SchemeImportResult:
         self.message = message
 
 
+class SchemeCloneResult:
+    """方案克隆结果"""
+    def __init__(self, success: bool, source_scheme_id: int = None,
+                 source_scheme_name: str = None, cloned_scheme_id: int = None,
+                 cloned_scheme_name: str = None, applied_batch_id: int = None,
+                 new_config_version: int = None, message: str = None):
+        self.success = success
+        self.source_scheme_id = source_scheme_id
+        self.source_scheme_name = source_scheme_name
+        self.cloned_scheme_id = cloned_scheme_id
+        self.cloned_scheme_name = cloned_scheme_name
+        self.applied_batch_id = applied_batch_id
+        self.new_config_version = new_config_version
+        self.message = message
+
+
 class PipelineService:
     """流水线服务类"""
 
@@ -540,7 +556,130 @@ class PipelineService:
                 )
             new_cfg = bump_config_version(scheme["config"])
             db.update_batch_config(conn, batch_id, new_cfg)
+            logger.info(f"方案已应用到批次: scheme_id={scheme_id}, scheme_name='{scheme['name']}', "
+                        f"batch_id={batch_id}, new_config_version={new_cfg['version']}")
             return new_cfg
+        finally:
+            conn.close()
+
+    def clone_scheme(self, source_scheme_id: int, new_name: str,
+                     new_description: str = None) -> int:
+        """
+        基于已有方案克隆出新方案。
+        - 校验源方案存在
+        - 校验新名称不冲突（同名抛出 SchemeConflictError）
+        - 克隆配置内容，创建新方案记录
+        """
+        conn = self._conn()
+        try:
+            source = db.get_scheme(conn, source_scheme_id)
+            if not source:
+                raise SchemeError(f"源方案不存在: {source_scheme_id}")
+
+            existing = db.get_scheme_by_name(conn, new_name)
+            if existing:
+                raise SchemeConflictError(
+                    SchemeConflictError.CONFLICT_NAME,
+                    f"方案名称已存在: '{new_name}'",
+                    {
+                        "existing_scheme_id": existing["id"],
+                        "source_scheme_id": source_scheme_id,
+                        "source_scheme_name": source["name"]
+                    }
+                )
+
+            description = new_description if new_description is not None else source.get("description")
+            config = source["config"]
+
+            valid, missing = db.validate_scheme_config(config)
+            if not valid:
+                raise SchemeConflictError(
+                    SchemeConflictError.CONFLICT_MISSING_FIELDS,
+                    f"源方案配置缺少必填字段: {', '.join(missing)}",
+                    {"missing_fields": missing, "source_scheme_id": source_scheme_id}
+                )
+
+            cloned_id = db.create_scheme(conn, new_name, config, description)
+            logger.info(
+                f"方案已克隆: source_id={source_scheme_id}, source_name='{source['name']}', "
+                f"cloned_id={cloned_id}, cloned_name='{new_name}'"
+            )
+            return cloned_id
+        finally:
+            conn.close()
+
+    def clone_and_apply_scheme(self, source_scheme_id: int, new_name: str,
+                               batch_id: int, new_description: str = None) -> SchemeCloneResult:
+        """
+        克隆方案并立即应用到指定批次。
+        步骤：
+        1. 克隆源方案为新方案（含冲突检测）
+        2. 将新方案应用到批次（含锁定批次保护）
+        3. 返回克隆结果（含新方案 ID、批次新配置版本等）
+        """
+        conn = self._conn()
+        try:
+            source = db.get_scheme(conn, source_scheme_id)
+            if not source:
+                raise SchemeError(f"源方案不存在: {source_scheme_id}")
+
+            batch = db.get_batch(conn, batch_id)
+            if not batch:
+                raise BatchServiceError(f"批次不存在: {batch_id}")
+
+            if db.is_batch_locked(conn, batch_id):
+                raise BatchLockedError(
+                    f"批次 {batch_id} 已锁定，无法应用克隆方案。"
+                    f"如需使用该方案进行对比分析，请使用 compare 命令直接生成报告，"
+                    f"而不要修改已锁定批次的历史配置。"
+                )
+
+            existing = db.get_scheme_by_name(conn, new_name)
+            if existing:
+                raise SchemeConflictError(
+                    SchemeConflictError.CONFLICT_NAME,
+                    f"方案名称已存在: '{new_name}'",
+                    {
+                        "existing_scheme_id": existing["id"],
+                        "source_scheme_id": source_scheme_id,
+                        "source_scheme_name": source["name"]
+                    }
+                )
+
+            description = new_description if new_description is not None else source.get("description")
+            config = source["config"]
+
+            valid, missing = db.validate_scheme_config(config)
+            if not valid:
+                raise SchemeConflictError(
+                    SchemeConflictError.CONFLICT_MISSING_FIELDS,
+                    f"源方案配置缺少必填字段: {', '.join(missing)}",
+                    {"missing_fields": missing, "source_scheme_id": source_scheme_id}
+                )
+
+            cloned_id = db.create_scheme(conn, new_name, config, description)
+            logger.info(
+                f"方案已克隆(链路): source_id={source_scheme_id}, source_name='{source['name']}', "
+                f"cloned_id={cloned_id}, cloned_name='{new_name}'"
+            )
+
+            new_cfg = bump_config_version(config)
+            db.update_batch_config(conn, batch_id, new_cfg)
+            logger.info(
+                f"克隆方案已应用到批次: scheme_id={cloned_id}, scheme_name='{new_name}', "
+                f"batch_id={batch_id}, new_config_version={new_cfg['version']}"
+            )
+
+            return SchemeCloneResult(
+                success=True,
+                source_scheme_id=source_scheme_id,
+                source_scheme_name=source["name"],
+                cloned_scheme_id=cloned_id,
+                cloned_scheme_name=new_name,
+                applied_batch_id=batch_id,
+                new_config_version=new_cfg["version"],
+                message=f"方案克隆并应用成功"
+            )
         finally:
             conn.close()
 

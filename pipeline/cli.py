@@ -7,7 +7,7 @@ from tabulate import tabulate
 
 from .service import (
     PipelineService, BatchServiceError, BatchLockedError,
-    SchemeError, SchemeConflictError, SchemeImportResult
+    SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult
 )
 from .config import get_default_config, load_config
 
@@ -484,6 +484,59 @@ def scheme_delete(ctx, scheme_id):
         click.echo(f"{OK} 方案 {scheme_id} 已删除")
     except SchemeError as e:
         click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("clone")
+@click.argument("source_scheme_id", type=int)
+@click.argument("new_name")
+@click.option("--description", default=None, help="新方案描述（不指定则沿用源方案）")
+@click.pass_context
+def scheme_clone(ctx, source_scheme_id, new_name, description):
+    """基于已有方案克隆出新方案，可改名称和描述"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        cloned_id = svc.clone_scheme(source_scheme_id, new_name, description)
+        click.echo(f"{OK} 方案克隆成功")
+        click.echo(f"  源方案:   ID={source_scheme_id}")
+        click.echo(f"  新方案:   ID={cloned_id}, 名称='{new_name}'")
+    except SchemeConflictError as e:
+        click.echo(f"{ERR} 冲突({e.conflict_type}): {e}", err=True)
+        click.echo(f"  详情: {e.details}", err=True)
+        sys.exit(1)
+    except SchemeError as e:
+        click.echo(f"{ERR} 方案错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("clone-apply")
+@click.argument("source_scheme_id", type=int)
+@click.argument("new_name")
+@click.argument("batch_id", type=int)
+@click.option("--description", default=None, help="新方案描述（不指定则沿用源方案）")
+@click.pass_context
+def scheme_clone_apply(ctx, source_scheme_id, new_name, batch_id, description):
+    """克隆方案并立即应用到未锁定批次（不自动重跑）"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.clone_and_apply_scheme(source_scheme_id, new_name, batch_id, description)
+        click.echo(f"{OK} 方案克隆并应用成功")
+        click.echo(f"  源方案:   ID={result.source_scheme_id}, 名称='{result.source_scheme_name}'")
+        click.echo(f"  新方案:   ID={result.cloned_scheme_id}, 名称='{result.cloned_scheme_name}'")
+        click.echo(f"  应用批次: ID={result.applied_batch_id}, 配置版本升至 v{result.new_config_version}")
+        click.echo("  请执行 process 命令以使用新配置重跑该批次。")
+    except SchemeConflictError as e:
+        click.echo(f"{ERR} 冲突({e.conflict_type}): {e}", err=True)
+        click.echo(f"  详情: {e.details}", err=True)
+        sys.exit(1)
+    except BatchLockedError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+    except SchemeError as e:
+        click.echo(f"{ERR} 方案错误: {e}", err=True)
+        sys.exit(1)
+    except BatchServiceError as e:
+        click.echo(f"{ERR} 批次错误: {e}", err=True)
         sys.exit(1)
 
 
