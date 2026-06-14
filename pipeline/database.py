@@ -93,11 +93,38 @@ def init_db(db_path: str = None) -> None:
                 FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS analysis_schemes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                scheme_version TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS comparison_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                scheme_id INTEGER,
+                scheme_name TEXT,
+                scheme_version TEXT,
+                batch_ids_json TEXT NOT NULL,
+                batch_summaries_json TEXT NOT NULL,
+                metrics_diff_json TEXT NOT NULL,
+                anomalies_diff_json TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (scheme_id) REFERENCES analysis_schemes(id) ON DELETE SET NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_runs_batch_id ON runs(batch_id);
             CREATE INDEX IF NOT EXISTS idx_row_errors_run_id ON row_errors(run_id);
             CREATE INDEX IF NOT EXISTS idx_metrics_run_id ON metrics(run_id);
             CREATE INDEX IF NOT EXISTS idx_anomalies_run_id ON anomalies(run_id);
             CREATE INDEX IF NOT EXISTS idx_exports_batch_id ON exports(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_analysis_schemes_name ON analysis_schemes(name);
+            CREATE INDEX IF NOT EXISTS idx_comparison_reports_scheme_id ON comparison_reports(scheme_id);
         """)
         conn.commit()
     finally:
@@ -306,3 +333,172 @@ def list_exports(conn: sqlite3.Connection, batch_id: int) -> List[Dict[str, Any]
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM exports WHERE batch_id = ? ORDER BY id DESC", (batch_id,))
     return [dict(row) for row in cursor.fetchall()]
+
+
+# ============ Analysis Scheme Operations ============
+
+SCHEME_VERSION = "1.0"
+REQUIRED_SCHEME_FIELDS = {"cleaning", "missing_values", "anomaly_detection", "metrics"}
+
+
+def create_scheme(conn: sqlite3.Connection, name: str, config: Dict[str, Any],
+                  description: str = None) -> int:
+    """创建新分析方案，返回方案 ID"""
+    now = datetime.now().isoformat()
+    config_json = json.dumps(config, ensure_ascii=False)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO analysis_schemes (name, description, scheme_version, config_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (name, description, SCHEME_VERSION, config_json, now, now))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def update_scheme(conn: sqlite3.Connection, scheme_id: int, config: Dict[str, Any],
+                  description: str = None) -> None:
+    """更新已有分析方案（覆盖）"""
+    now = datetime.now().isoformat()
+    config_json = json.dumps(config, ensure_ascii=False)
+    cursor = conn.cursor()
+    if description is not None:
+        cursor.execute("""
+            UPDATE analysis_schemes SET config_json = ?, description = ?, updated_at = ? WHERE id = ?
+        """, (config_json, description, now, scheme_id))
+    else:
+        cursor.execute("""
+            UPDATE analysis_schemes SET config_json = ?, updated_at = ? WHERE id = ?
+        """, (config_json, now, scheme_id))
+    conn.commit()
+
+
+def get_scheme(conn: sqlite3.Connection, scheme_id: int) -> Optional[Dict[str, Any]]:
+    """按 ID 获取方案"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM analysis_schemes WHERE id = ?", (scheme_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["config"] = json.loads(result["config_json"])
+    del result["config_json"]
+    return result
+
+
+def get_scheme_by_name(conn: sqlite3.Connection, name: str) -> Optional[Dict[str, Any]]:
+    """按名称获取方案"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM analysis_schemes WHERE name = ?", (name,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["config"] = json.loads(result["config_json"])
+    del result["config_json"]
+    return result
+
+
+def list_schemes(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """列出所有分析方案（不含 config 详情，节省内存）"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, description, scheme_version, created_at, updated_at FROM analysis_schemes ORDER BY updated_at DESC")
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def delete_scheme(conn: sqlite3.Connection, scheme_id: int) -> None:
+    """删除方案"""
+    conn.execute("DELETE FROM analysis_schemes WHERE id = ?", (scheme_id,))
+    conn.commit()
+
+
+def validate_scheme_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """校验方案配置是否包含必填字段，返回 (是否合法, 缺失字段列表)"""
+    missing = []
+    for field in REQUIRED_SCHEME_FIELDS:
+        if field not in config:
+            missing.append(field)
+    return (len(missing) == 0), missing
+
+
+def check_scheme_version_compatibility(scheme_version: str) -> Tuple[bool, str]:
+    """校验导入方案的版本兼容性"""
+    if scheme_version == SCHEME_VERSION:
+        return True, ""
+    try:
+        major = scheme_version.split(".")[0]
+        current_major = SCHEME_VERSION.split(".")[0]
+        if major == current_major:
+            return True, f"版本兼容 (导入 {scheme_version}, 当前 {SCHEME_VERSION})"
+        else:
+            return False, f"主版本不兼容: 导入 {scheme_version}, 当前 {SCHEME_VERSION}"
+    except Exception:
+        return False, f"无法解析版本号: {scheme_version}"
+
+
+# ============ Comparison Report Operations ============
+
+def create_comparison_report(conn: sqlite3.Connection, name: str, scheme_id: Optional[int],
+                             scheme_name: Optional[str], scheme_version: Optional[str],
+                             batch_ids: List[int], batch_summaries: List[Dict[str, Any]],
+                             metrics_diff: Dict[str, Any], anomalies_diff: Dict[str, Any],
+                             full_report: Dict[str, Any]) -> int:
+    """创建对比报告记录，返回报告 ID"""
+    now = datetime.now().isoformat()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO comparison_reports (
+            name, scheme_id, scheme_name, scheme_version,
+            batch_ids_json, batch_summaries_json,
+            metrics_diff_json, anomalies_diff_json, report_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        name, scheme_id, scheme_name, scheme_version,
+        json.dumps(batch_ids, ensure_ascii=False),
+        json.dumps(batch_summaries, ensure_ascii=False),
+        json.dumps(metrics_diff, ensure_ascii=False),
+        json.dumps(anomalies_diff, ensure_ascii=False),
+        json.dumps(full_report, ensure_ascii=False),
+        now
+    ))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_comparison_report(conn: sqlite3.Connection, report_id: int) -> Optional[Dict[str, Any]]:
+    """获取对比报告"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM comparison_reports WHERE id = ?", (report_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["batch_ids"] = json.loads(result["batch_ids_json"])
+    result["batch_summaries"] = json.loads(result["batch_summaries_json"])
+    result["metrics_diff"] = json.loads(result["metrics_diff_json"])
+    result["anomalies_diff"] = json.loads(result["anomalies_diff_json"])
+    result["report"] = json.loads(result["report_json"])
+    for k in ("batch_ids_json", "batch_summaries_json", "metrics_diff_json", "anomalies_diff_json", "report_json"):
+        del result[k]
+    return result
+
+
+def list_comparison_reports(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """列出所有对比报告（不含详细 diff，节省内存）"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, name, scheme_id, scheme_name, scheme_version, batch_ids_json, created_at
+        FROM comparison_reports ORDER BY created_at DESC
+    """)
+    results = []
+    for row in cursor.fetchall():
+        r = dict(row)
+        r["batch_ids"] = json.loads(r["batch_ids_json"])
+        del r["batch_ids_json"]
+        results.append(r)
+    return results
+
+
+def delete_comparison_report(conn: sqlite3.Connection, report_id: int) -> None:
+    """删除对比报告"""
+    conn.execute("DELETE FROM comparison_reports WHERE id = ?", (report_id,))
+    conn.commit()

@@ -19,7 +19,10 @@ import sqlite3
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline.service import PipelineService, BatchLockedError, BatchServiceError
+from pipeline.service import (
+    PipelineService, BatchLockedError, BatchServiceError,
+    SchemeError, SchemeConflictError, SchemeImportResult
+)
 from pipeline import database as db
 from pipeline.processor import import_csv
 from pipeline.config import get_default_config
@@ -259,6 +262,274 @@ def run_tests():
         except Exception as e:
             r7.fail(str(e))
             print(f"  [FAIL] {r7.name}: {e}")
+
+        # ====== 测试 8: 方案保存后跨重启一致性 ======
+        r8 = TestResult("测试8: 分析方案保存后跨重启一致")
+        results.append(r8)
+        try:
+            svc3 = PipelineService(db_path)
+            scheme_name = "scheme_for_restart_test"
+            sid = svc3.save_scheme(scheme_name, batch_id=batch_id, description="重启测试方案")
+            scheme_before = svc3.get_scheme(sid)
+            assert scheme_before["name"] == scheme_name
+            assert "cleaning" in scheme_before["config"]
+            assert "missing_values" in scheme_before["config"]
+
+            del svc3
+            svc4 = PipelineService(db_path)
+            scheme_after = svc4.get_scheme(sid)
+            assert scheme_after is not None, "重启后方案应存在"
+            assert scheme_after["id"] == sid
+            assert scheme_after["name"] == scheme_before["name"]
+            assert scheme_after["scheme_version"] == scheme_before["scheme_version"]
+            assert scheme_after["description"] == scheme_before["description"]
+            assert json.dumps(scheme_after["config"], sort_keys=True) == \
+                   json.dumps(scheme_before["config"], sort_keys=True), \
+                   "重启前后方案配置应完全一致"
+
+            schemes_list = svc4.list_schemes()
+            assert any(s["id"] == sid for s in schemes_list), "list_schemes 应包含保存的方案"
+
+            r8.ok()
+            print(f"  [PASS] {r8.name}  (scheme_id={sid})")
+        except Exception as e:
+            r8.fail(str(e))
+            print(f"  [FAIL] {r8.name}: {e}")
+
+        # ====== 测试 9: 方案导入冲突（同名、字段缺失、版本不兼容） ======
+        r9 = TestResult("测试9: 方案导入冲突处理（同名/字段缺失/版本不兼容）")
+        results.append(r9)
+        try:
+            svc5 = PipelineService(db_path)
+
+            schemes_tmp = os.path.join(tmpdir, "schemes")
+            os.makedirs(schemes_tmp, exist_ok=True)
+
+            base_scheme_path = os.path.join(schemes_tmp, "base.json")
+            svc5.export_scheme_to_file(sid, base_scheme_path)
+
+            res_skip = svc5.import_scheme_from_file(
+                base_scheme_path, on_conflict=SchemeImportResult.ACTION_SKIP)
+            assert not res_skip.success, "同名 skip 应返回 success=False"
+            assert res_skip.action == SchemeImportResult.ACTION_SKIP
+
+            res_overwrite = svc5.import_scheme_from_file(
+                base_scheme_path, on_conflict=SchemeImportResult.ACTION_OVERWRITE)
+            assert res_overwrite.success, "同名 overwrite 应成功"
+            assert res_overwrite.action == SchemeImportResult.ACTION_OVERWRITE
+            assert res_overwrite.scheme_id == sid
+
+            res_rename = svc5.import_scheme_from_file(
+                base_scheme_path, on_conflict=SchemeImportResult.ACTION_RENAME,
+                new_name="scheme_renamed_v1")
+            assert res_rename.success, "rename 应成功"
+            assert res_rename.action == SchemeImportResult.ACTION_RENAME
+            assert res_rename.scheme_id != sid
+
+            missing_field_path = os.path.join(schemes_tmp, "missing.json")
+            with open(base_scheme_path, "r", encoding="utf-8") as f:
+                bad_data = json.load(f)
+            del bad_data["config"]["cleaning"]
+            with open(missing_field_path, "w", encoding="utf-8") as f:
+                json.dump(bad_data, f, ensure_ascii=False)
+
+            try:
+                svc5.import_scheme_from_file(missing_field_path, on_conflict=None)
+                assert False, "字段缺失应抛出 SchemeConflictError"
+            except SchemeConflictError as sce:
+                assert sce.conflict_type == SchemeConflictError.CONFLICT_MISSING_FIELDS
+                assert "cleaning" in sce.details.get("missing_fields", [])
+
+            bad_version_path = os.path.join(schemes_tmp, "bad_version.json")
+            with open(base_scheme_path, "r", encoding="utf-8") as f:
+                bad_v = json.load(f)
+            bad_v["scheme_version"] = "99.0"
+            with open(bad_version_path, "w", encoding="utf-8") as f:
+                json.dump(bad_v, f, ensure_ascii=False)
+
+            try:
+                svc5.import_scheme_from_file(bad_version_path, on_conflict=None)
+                assert False, "版本不兼容应抛出 SchemeConflictError"
+            except SchemeConflictError as sce:
+                assert sce.conflict_type == SchemeConflictError.CONFLICT_VERSION
+
+            r9.ok()
+            print(f"  [PASS] {r9.name}  (skip/overwrite/rename/missing_field/version 均通过)")
+        except Exception as e:
+            r9.fail(str(e))
+            print(f"  [FAIL] {r9.name}: {e}")
+
+        # ====== 测试 10: 锁定批次参与对比（不被改写） ======
+        r10 = TestResult("测试10: 锁定批次参与对比但不被改写，方案可关联报告")
+        results.append(r10)
+        try:
+            svc6 = PipelineService(db_path)
+
+            second_batch_id = svc6.create_batch("second_for_compare", SAMPLE_CSV)
+            svc6.set_threshold(second_batch_id, zscore_threshold=1.0)
+            svc6.process_batch(second_batch_id)
+
+            svc6.lock_batch(batch_id)
+            locked_batch = svc6.get_batch(batch_id)
+            assert locked_batch["status"] == "locked"
+            runs_before = svc6.list_runs(batch_id)
+            runs_before_count = len(runs_before)
+            metrics_before = svc6.get_run_metrics(runs_before[0]["id"])
+            anomalies_before = svc6.get_run_anomalies(runs_before[0]["id"])
+
+            report = svc6.generate_comparison_report(
+                "compare_locked_batch", [batch_id, second_batch_id], scheme_id=sid)
+            assert report["report_id"] > 0
+            assert report["scheme"]["id"] == sid
+            assert report["scheme"]["name"] is not None
+
+            batch_summaries = report["batch_summaries"]
+            locked_summary = next(b for b in batch_summaries if b["batch_id"] == batch_id)
+            assert locked_summary["locked"] is True
+
+            runs_after = svc6.list_runs(batch_id)
+            assert len(runs_after) == runs_before_count, \
+                f"锁定批次参与对比不应新增 run: before={runs_before_count}, after={len(runs_after)}"
+
+            locked_batch2 = svc6.get_batch(batch_id)
+            assert locked_batch2["status"] == "locked", "锁定批次状态不应改变"
+
+            metrics_after = svc6.get_run_metrics(runs_after[0]["id"])
+            assert len(metrics_after) == len(metrics_before)
+            for m1, m2 in zip(sorted(metrics_before, key=lambda x: (x["sensor_name"], x["metric_name"])),
+                              sorted(metrics_after, key=lambda x: (x["sensor_name"], x["metric_name"]))):
+                assert abs(m1["metric_value"] - m2["metric_value"]) < 1e-9
+
+            anomalies_after = svc6.get_run_anomalies(runs_after[0]["id"])
+            assert len(anomalies_after) == len(anomalies_before)
+
+            del svc6
+            svc7 = PipelineService(db_path)
+            reports_list = svc7.list_comparison_reports()
+            assert any(r["id"] == report["report_id"] for r in reports_list), \
+                "重启后对比报告应保留"
+            report_reloaded = svc7.get_comparison_report(report["report_id"])
+            assert report_reloaded is not None
+            assert report_reloaded["scheme_name"] is not None
+            assert batch_id in report_reloaded["batch_ids"]
+
+            r10.ok()
+            print(f"  [PASS] {r10.name}  (report_id={report['report_id']}, locked_runs={runs_before_count})")
+        except Exception as e:
+            r10.fail(str(e))
+            print(f"  [FAIL] {r10.name}: {e}")
+
+        # ====== 测试 11: 报告导出 JSON/CSV 字段稳定性 ======
+        r11 = TestResult("测试11: 对比报告导出 JSON/CSV 字段稳定一致")
+        results.append(r11)
+        try:
+            svc8 = PipelineService(db_path)
+            existing_reports = svc8.list_comparison_reports()
+            assert len(existing_reports) > 0, "应有已生成的报告"
+            rid = existing_reports[0]["id"]
+
+            json_out = os.path.join(out_dir, f"report_{rid}.json")
+            svc8.export_comparison_report_json(rid, json_out)
+            assert os.path.exists(json_out)
+            with open(json_out, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
+            for key in ("name", "scheme", "generated_at", "batch_summaries",
+                        "metrics_diff", "anomalies_diff"):
+                assert key in json_data, f"JSON 报告缺少字段: {key}"
+            assert "id" in json_data["scheme"] and "name" in json_data["scheme"] and "version" in json_data["scheme"]
+            assert len(json_data["batch_summaries"]) >= 2
+            for bs in json_data["batch_summaries"]:
+                for h in ("batch_id", "batch_name", "locked", "source_file",
+                          "config_version", "run_id", "run_number",
+                          "anomalies_count", "metrics_count"):
+                    assert h in bs, f"batch_summary 缺少字段: {h}"
+            md_summary = json_data["metrics_diff"]["summary"]
+            for h in ("total_metrics_compared", "metrics_with_diff", "batch_keys"):
+                assert h in md_summary, f"metrics_diff.summary 缺少字段: {h}"
+            ad = json_data["anomalies_diff"]
+            for h in ("per_batch", "total_anomalies_range", "sensors_with_anomalies"):
+                assert h in ad, f"anomalies_diff 缺少字段: {h}"
+
+            csv_dir = os.path.join(out_dir, f"report_csv_{rid}")
+            csv_paths = svc8.export_comparison_report_csv(rid, csv_dir)
+            for key in ("summary", "batches", "metrics", "anomalies"):
+                assert key in csv_paths, f"CSV 导出缺少文件: {key}"
+                assert os.path.exists(csv_paths[key])
+
+            import csv as csv_mod
+            with open(csv_paths["summary"], "r", encoding="utf-8-sig") as f:
+                reader = csv_mod.DictReader(f)
+                headers_summary = reader.fieldnames
+                for h in ("report_id", "report_name", "scheme_name", "scheme_version",
+                          "generated_at", "batch_count"):
+                    assert h in headers_summary, f"summary.csv 缺少表头: {h}"
+                row = next(reader)
+                assert int(row["report_id"]) == rid
+
+            with open(csv_paths["batches"], "r", encoding="utf-8-sig") as f:
+                reader = csv_mod.DictReader(f)
+                headers_b = reader.fieldnames
+                for h in ("batch_id", "batch_name", "locked", "source_file",
+                          "config_version", "run_id", "run_number",
+                          "anomalies_count", "metrics_count"):
+                    assert h in headers_b, f"batches.csv 缺少表头: {h}"
+                rows_b = list(reader)
+                assert len(rows_b) >= 2
+
+            with open(csv_paths["metrics"], "r", encoding="utf-8-sig") as f:
+                reader = csv_mod.DictReader(f)
+                headers_m = reader.fieldnames
+                assert "sensor" in headers_m and "metric" in headers_m
+                assert "abs_diff" in headers_m and "rel_diff_pct" in headers_m
+
+            with open(csv_paths["anomalies"], "r", encoding="utf-8-sig") as f:
+                reader = csv_mod.DictReader(f)
+                headers_a = reader.fieldnames
+                for h in ("batch_id", "batch_name", "locked", "total_anomalies"):
+                    assert h in headers_a, f"anomalies.csv 缺少表头: {h}"
+
+            r11.ok()
+            print(f"  [PASS] {r11.name}  (json + {len(csv_paths)} csv files 均通过)")
+        except Exception as e:
+            r11.fail(str(e))
+            print(f"  [FAIL] {r11.name}: {e}")
+
+        # ====== 测试 12: CLI 新增命令帮助文本完整 ======
+        r12 = TestResult("测试12: CLI scheme/compare 命令帮助文本完整")
+        results.append(r12)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+
+            runner = CliRunner()
+
+            res_scheme = runner.invoke(cli, ["scheme", "--help"])
+            assert res_scheme.exit_code == 0
+            assert "save" in res_scheme.output
+            assert "list" in res_scheme.output
+            assert "import" in res_scheme.output
+            assert "export" in res_scheme.output
+            assert "apply" in res_scheme.output
+
+            res_cmp = runner.invoke(cli, ["compare", "--help"])
+            assert res_cmp.exit_code == 0
+            assert "run" in res_cmp.output
+            assert "list" in res_cmp.output
+            assert "export" in res_cmp.output
+
+            res_run = runner.invoke(cli, ["compare", "run", "--help"])
+            assert res_run.exit_code == 0
+            assert "scheme-id" in res_run.output
+
+            res_imp = runner.invoke(cli, ["scheme", "import", "--help"])
+            assert res_imp.exit_code == 0
+            assert "on-conflict" in res_imp.output
+
+            r12.ok()
+            print(f"  [PASS] {r12.name}")
+        except Exception as e:
+            r12.fail(str(e))
+            print(f"  [FAIL] {r12.name}: {e}")
 
         # ====== 汇总 ======
         print()
