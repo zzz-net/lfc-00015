@@ -104,6 +104,22 @@ python -m pipeline compare export 1 -o exports/ --format csv
 - `original_baseline_id`: 导入基线的原始 ID（从原数据库导出时的 ID）
 - `imported_from`: 导入来源（ZIP 文件名或路径哈希）
 
+### 复核工单 (Review Ticket)
+
+将复核失败、告警过多或被基线拦住的批次直接转成可追踪任务。工单保存来源批次和运行、触发规则、责任人、处理结论、备注时间线和当前状态，重启后完整可查。
+
+**工单状态流转：**
+- `open`（待处理）→ `assigned`（已分配）→ `resolved`（已关闭）→ `reopened`（已重开）→ `assigned` / `resolved`
+- 创建时指定 `--assignee` 则直接进入 `assigned`
+
+**导入导出：**
+- 导出时把工单本体和完整处理历史（备注时间线）一起写入 JSON
+- 导入时遇到同标题或同来源冲突，支持 `reject`（拒绝）和 `rename`（自动重命名），决定写入审计日志
+
+**追溯字段：**
+- `original_ticket_id`: 导入工单的原始 ID（从原数据库导出时的 ID）
+- `imported_from`: 导入来源（文件名@导出时间）
+
 ## CLI 命令
 
 ### 基础命令
@@ -321,3 +337,14 @@ python samples/regression_test.py
 - **replay 容忍度机制**：指标差异超出容忍度时标记为不可接受，列出失败指标
 - **快照审计日志查询**：可按操作类型和结果筛选，所有快照操作均有审计记录
 - **CLI snapshot 命令**：帮助文本完整，输出与文档对齐
+- **基线注册+重启持久化**：注册基线后重启重新连接，配置版本、指标阈值、来源摘要、备注完整可查
+- **基线复核-通过(pass)**：同批次用大阈值复核，所有指标 pass，建议动作为"继续监控"
+- **基线复核-阻断(block)**：用极小阈值+差异数据复核，触发 block 状态，列出超阈值指标及差异百分比
+- **基线三级状态优先级**：block > warn > pass，判定逻辑正确
+- **基线导出**：ZIP 包含 6 个必需文件（summary/config/thresholds/source/check_history/checksum），SHA256 校验和匹配
+- **基线导入冲突-reject**：同名基线导入时 reject 策略阻止，写入 blocked 审计日志
+- **基线导入冲突-rename**：同名时 rename 策略成功导入，保持 original_baseline_id 和 imported_from 追溯
+- **基线复核历史追溯**：多次复核后 history 完整，字段齐全可查
+- **基线审计日志链路**：注册/复核/导出/导入/删除 5 种动作均有审计记录，支持按操作类型筛选
+- **基线软删除**：删除后 status=deleted，历史记录和审计日志保留
+- **CLI baseline 命令**：register/check/export/list/show/import/history 帮助文本完整，输出与文档对齐

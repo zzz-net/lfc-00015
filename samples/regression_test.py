@@ -23,7 +23,8 @@ from pipeline.service import (
     PipelineService, BatchLockedError, BatchServiceError,
     SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult,
     SchemeDeriveResult, SchemeRollbackResult, DryRunResult, DryRunRisk,
-    SwitchSchemeResult
+    SwitchSchemeResult,
+    TicketError, TicketConflictError, TicketImportResult
 )
 from pipeline import database as db
 from pipeline.processor import import_csv
@@ -4107,6 +4108,409 @@ def run_tests():
         except Exception as e:
             r81.fail(str(e))
             print(f"  [FAIL] {r81.name}: {e}")
+
+        # ====== 复核工单测试 ======
+
+        r82 = TestResult("测试82: 工单创建后重启持久化（工单和备注时间线完整可查）")
+        results.append(r82)
+        try:
+            ticket_db = os.path.join(tmpdir, "ticket_test.db")
+            svc_t = PipelineService(ticket_db)
+            svc_t.create_batch("ticket_batch_001", SAMPLE_CSV)
+
+            tid1 = svc_t.create_ticket("复核失败-批次001", source_batch_id=1,
+                                       trigger_rule="baseline_block", assignee="zhangsan")
+            svc_t.resolve_ticket(tid1, "已修正阈值配置")
+
+            tid2 = svc_t.create_ticket("告警过多-批次002", source_batch_id=1,
+                                       trigger_rule="alert_overflow")
+            svc_t.assign_ticket(tid2, "lisi")
+            svc_t.add_ticket_note(tid2, "正在排查告警来源", author="lisi")
+
+            del svc_t
+            svc_t2 = PipelineService(ticket_db)
+
+            t1 = svc_t2.get_ticket(tid1)
+            assert t1 is not None, "重启后工单1不存在"
+            assert t1["title"] == "复核失败-批次001"
+            assert t1["status"] == db.TICKET_STATUS_RESOLVED
+            assert t1["resolution"] == "已修正阈值配置"
+            assert t1["assignee"] == "zhangsan"
+            assert t1["trigger_rule"] == "baseline_block"
+
+            notes1 = svc_t2.get_ticket_notes(tid1)
+            assert len(notes1) >= 2, f"工单1至少有2条备注(创建+关闭), 实际{len(notes1)}"
+            note_types = [n["note_type"] for n in notes1]
+            assert db.TICKET_NOTE_ASSIGN in note_types or db.TICKET_NOTE_STATUS_CHANGE in note_types
+            assert db.TICKET_NOTE_RESOLVE in note_types
+
+            t2 = svc_t2.get_ticket(tid2)
+            assert t2 is not None, "重启后工单2不存在"
+            assert t2["status"] == db.TICKET_STATUS_ASSIGNED
+            assert t2["assignee"] == "lisi"
+
+            notes2 = svc_t2.get_ticket_notes(tid2)
+            assert len(notes2) >= 2, f"工单2至少有2条备注, 实际{len(notes2)}"
+            comment_notes = [n for n in notes2 if n["note_type"] == db.TICKET_NOTE_COMMENT]
+            assert len(comment_notes) >= 1, "工单2应有手动备注"
+            assert "排查" in comment_notes[0]["content"]
+
+            r82.ok()
+            print(f"  [PASS] {r82.name}")
+        except Exception as e:
+            r82.fail(str(e))
+            print(f"  [FAIL] {r82.name}: {e}")
+
+        r83 = TestResult("测试83: 责任人筛选（list --assignee 过滤正确）")
+        results.append(r83)
+        try:
+            ticket_db2 = os.path.join(tmpdir, "ticket_filter.db")
+            svc_f = PipelineService(ticket_db2)
+            svc_f.create_batch("filter_batch", SAMPLE_CSV)
+
+            svc_f.create_ticket("工单A", source_batch_id=1, assignee="alice")
+            svc_f.create_ticket("工单B", source_batch_id=1, assignee="bob")
+            svc_f.create_ticket("工单C", source_batch_id=1, assignee="alice")
+
+            alice_tickets = svc_f.list_tickets(assignee="alice")
+            assert len(alice_tickets) == 2, f"alice应有2个工单, 实际{len(alice_tickets)}"
+            assert all(t["assignee"] == "alice" for t in alice_tickets)
+
+            bob_tickets = svc_f.list_tickets(assignee="bob")
+            assert len(bob_tickets) == 1, f"bob应有1个工单, 实际{len(bob_tickets)}"
+            assert bob_tickets[0]["title"] == "工单B"
+
+            all_tickets = svc_f.list_tickets()
+            assert len(all_tickets) == 3, f"总共应有3个工单, 实际{len(all_tickets)}"
+
+            r83.ok()
+            print(f"  [PASS] {r83.name}")
+        except Exception as e:
+            r83.fail(str(e))
+            print(f"  [FAIL] {r83.name}: {e}")
+
+        r84 = TestResult("测试84: 关闭后重新打开（resolve → reopen 流程完整）")
+        results.append(r84)
+        try:
+            ticket_db3 = os.path.join(tmpdir, "ticket_reopen.db")
+            svc_r = PipelineService(ticket_db3)
+            svc_r.create_batch("reopen_batch", SAMPLE_CSV)
+
+            tid = svc_r.create_ticket("基线阻断-批次003", source_batch_id=1,
+                                      trigger_rule="baseline_block")
+            svc_r.assign_ticket(tid, "wangwu")
+            svc_r.resolve_ticket(tid, "已修复数据源问题")
+
+            t = svc_r.get_ticket(tid)
+            assert t["status"] == db.TICKET_STATUS_RESOLVED
+            assert t["resolution"] == "已修复数据源问题"
+
+            svc_r.reopen_ticket(tid, "问题再次出现，告警仍未消除")
+            t2 = svc_r.get_ticket(tid)
+            assert t2["status"] == db.TICKET_STATUS_REOPENED
+
+            notes = svc_r.get_ticket_notes(tid)
+            reopen_notes = [n for n in notes if n["note_type"] == db.TICKET_NOTE_REOPEN]
+            assert len(reopen_notes) >= 1, "应有重开备注"
+            assert "再次出现" in reopen_notes[0]["content"]
+
+            svc_r.assign_ticket(tid, "zhaoliu")
+            svc_r.resolve_ticket(tid, "二次修复完成")
+            t3 = svc_r.get_ticket(tid)
+            assert t3["status"] == db.TICKET_STATUS_RESOLVED
+            assert t3["resolution"] == "二次修复完成"
+
+            all_notes = svc_r.get_ticket_notes(tid)
+            resolve_notes = [n for n in all_notes if n["note_type"] == db.TICKET_NOTE_RESOLVE]
+            assert len(resolve_notes) == 2, f"应有2条关闭备注, 实际{len(resolve_notes)}"
+
+            svc_r.reopen_ticket(tid, "二次修复仍不够")
+            t_again = svc_r.get_ticket(tid)
+            assert t_again["status"] == db.TICKET_STATUS_REOPENED, "二次resolve后应能再次reopen"
+
+            r84.ok()
+            print(f"  [PASS] {r84.name}")
+        except Exception as e:
+            r84.fail(str(e))
+            print(f"  [FAIL] {r84.name}: {e}")
+
+        r85 = TestResult("测试85: 冲突导入-reject（同标题时拒绝，审计日志记录）")
+        results.append(r85)
+        try:
+            ticket_db4 = os.path.join(tmpdir, "ticket_reject.db")
+            svc_rej = PipelineService(ticket_db4)
+            svc_rej.create_batch("reject_batch", SAMPLE_CSV)
+
+            svc_rej.create_ticket("重复标题工单", source_batch_id=1)
+
+            export_path = os.path.join(tmpdir, "ticket_reject_export.json")
+            svc_rej.export_ticket(1, export_path)
+
+            result = svc_rej.import_ticket(export_path, on_conflict=TicketImportResult.ACTION_REJECT)
+            assert not result.success, "reject策略应返回success=False"
+            assert result.action == TicketImportResult.ACTION_REJECT
+            assert "拒绝" in result.message or "已存在" in result.message
+
+            logs = svc_rej.get_ticket_audit_logs(action=db.AUDIT_ACTION_TICKET_IMPORT)
+            blocked_logs = [l for l in logs if l.get("result") == db.AUDIT_RESULT_BLOCKED]
+            assert len(blocked_logs) >= 1, "reject策略应有blocked审计日志"
+
+            r85.ok()
+            print(f"  [PASS] {r85.name}")
+        except Exception as e:
+            r85.fail(str(e))
+            print(f"  [FAIL] {r85.name}: {e}")
+
+        r86 = TestResult("测试86: 冲突导入-rename（同标题时重命名成功，追溯字段完整）")
+        results.append(r86)
+        try:
+            ticket_db5 = os.path.join(tmpdir, "ticket_rename.db")
+            svc_rn = PipelineService(ticket_db5)
+            svc_rn.create_batch("rename_batch", SAMPLE_CSV)
+
+            svc_rn.create_ticket("重复标题工单B", source_batch_id=1)
+
+            export_path2 = os.path.join(tmpdir, "ticket_rename_export.json")
+            svc_rn.export_ticket(1, export_path2)
+
+            result = svc_rn.import_ticket(export_path2, on_conflict=TicketImportResult.ACTION_RENAME)
+            assert result.success, "rename策略应成功"
+            assert result.action == TicketImportResult.ACTION_RENAME
+            assert result.final_title != result.original_title
+            assert result.original_title == "重复标题工单B"
+            assert "imported" in result.final_title
+            assert result.original_ticket_id == 1
+
+            renamed_ticket = svc_rn.get_ticket(result.ticket_id)
+            assert renamed_ticket is not None
+            assert renamed_ticket["original_ticket_id"] == 1
+            assert renamed_ticket["imported_from"] is not None
+
+            logs = svc_rn.get_ticket_audit_logs(action=db.AUDIT_ACTION_TICKET_IMPORT)
+            success_logs = [l for l in logs if l.get("result") == db.AUDIT_RESULT_SUCCESS]
+            assert len(success_logs) >= 1, "rename导入应有成功审计日志"
+
+            r86.ok()
+            print(f"  [PASS] {r86.name}")
+        except Exception as e:
+            r86.fail(str(e))
+            print(f"  [FAIL] {r86.name}: {e}")
+
+        r87 = TestResult("测试87: 导入后继续处理（导入后可分配、关闭、重开）")
+        results.append(r87)
+        try:
+            ticket_db6 = os.path.join(tmpdir, "ticket_continue.db")
+            svc_c = PipelineService(ticket_db6)
+            svc_c.create_batch("continue_batch", SAMPLE_CSV)
+
+            tid_src = svc_c.create_ticket("待导入工单", source_batch_id=1,
+                                          trigger_rule="alert_overflow", assignee="alice")
+            svc_c.resolve_ticket(tid_src, "初步修复")
+
+            export_path3 = os.path.join(tmpdir, "ticket_continue_export.json")
+            svc_c.export_ticket(tid_src, export_path3)
+
+            ticket_db6b = os.path.join(tmpdir, "ticket_continue_target.db")
+            svc_c2 = PipelineService(ticket_db6b)
+            svc_c2.create_batch("target_batch", SAMPLE_CSV)
+
+            result = svc_c2.import_ticket(export_path3)
+            assert result.success
+            imported_tid = result.ticket_id
+
+            imported = svc_c2.get_ticket(imported_tid)
+            assert imported is not None
+
+            notes_imported = svc_c2.get_ticket_notes(imported_tid)
+            assert len(notes_imported) >= 2, f"导入工单应含原始备注, 实际{len(notes_imported)}"
+
+            svc_c2.reopen_ticket(imported_tid, "导入后发现新问题")
+            svc_c2.assign_ticket(imported_tid, "bob")
+            t_assigned = svc_c2.get_ticket(imported_tid)
+            assert t_assigned["assignee"] == "bob"
+            assert t_assigned["status"] == db.TICKET_STATUS_ASSIGNED
+
+            svc_c2.resolve_ticket(imported_tid, "彻底修复")
+            t_resolved = svc_c2.get_ticket(imported_tid)
+            assert t_resolved["status"] == db.TICKET_STATUS_RESOLVED
+            assert t_resolved["resolution"] == "彻底修复"
+
+            final_notes = svc_c2.get_ticket_notes(imported_tid)
+            note_types = [n["note_type"] for n in final_notes]
+            assert db.TICKET_NOTE_REOPEN in note_types, "应有重开备注"
+            assert db.TICKET_NOTE_RESOLVE in note_types, "应有关闭备注"
+            assert note_types.count(db.TICKET_NOTE_RESOLVE) >= 2, "应有2条关闭备注(原始+新)"
+
+            r87.ok()
+            print(f"  [PASS] {r87.name}")
+        except Exception as e:
+            r87.fail(str(e))
+            print(f"  [FAIL] {r87.name}: {e}")
+
+        r88 = TestResult("测试88: 历史追溯（notes 时间线和审计日志完整追溯全生命周期）")
+        results.append(r88)
+        try:
+            ticket_db7 = os.path.join(tmpdir, "ticket_trace.db")
+            svc_tr = PipelineService(ticket_db7)
+            svc_tr.create_batch("trace_batch", SAMPLE_CSV)
+
+            tid = svc_tr.create_ticket("追溯测试工单", source_batch_id=1,
+                                       trigger_rule="baseline_block")
+            svc_tr.assign_ticket(tid, "user1")
+            svc_tr.add_ticket_note(tid, "检查了基线配置", author="user1")
+            svc_tr.resolve_ticket(tid, "基线配置已修正")
+            svc_tr.reopen_ticket(tid, "修正后仍有问题")
+            svc_tr.assign_ticket(tid, "user2")
+            svc_tr.add_ticket_note(tid, "user2开始排查", author="user2")
+            svc_tr.resolve_ticket(tid, "最终修复完成")
+
+            notes = svc_tr.get_ticket_notes(tid)
+            assert len(notes) >= 7, f"应有至少7条备注, 实际{len(notes)}"
+
+            expected_types = [
+                db.TICKET_NOTE_ASSIGN,
+                db.TICKET_NOTE_COMMENT,
+                db.TICKET_NOTE_RESOLVE,
+                db.TICKET_NOTE_REOPEN,
+                db.TICKET_NOTE_ASSIGN,
+                db.TICKET_NOTE_COMMENT,
+                db.TICKET_NOTE_RESOLVE,
+            ]
+            actual_types = [n["note_type"] for n in notes]
+            for et in expected_types:
+                assert et in actual_types, f"缺少备注类型: {et}"
+
+            for n in notes:
+                assert n.get("created_at"), f"备注缺少创建时间: {n}"
+                assert n.get("content"), f"备注缺少内容: {n}"
+
+            from datetime import datetime as dt
+            note_times = []
+            for n in notes:
+                try:
+                    note_times.append(dt.fromisoformat(n["created_at"]))
+                except (ValueError, TypeError):
+                    pass
+            if len(note_times) >= 2:
+                for i in range(len(note_times) - 1):
+                    assert note_times[i] <= note_times[i + 1], \
+                        f"备注时间线不按顺序: {notes[i]['created_at']} > {notes[i+1]['created_at']}"
+
+            audit_logs = svc_tr.get_ticket_audit_logs(action=db.AUDIT_ACTION_TICKET_CREATE)
+            assert len(audit_logs) >= 1, "应有创建审计日志"
+
+            assign_logs = svc_tr.get_ticket_audit_logs(action=db.AUDIT_ACTION_TICKET_ASSIGN)
+            assert len(assign_logs) >= 2, f"应有2条分配审计日志, 实际{len(assign_logs)}"
+
+            resolve_logs = svc_tr.get_ticket_audit_logs(action=db.AUDIT_ACTION_TICKET_RESOLVE)
+            assert len(resolve_logs) >= 2, f"应有2条关闭审计日志, 实际{len(resolve_logs)}"
+
+            reopen_logs = svc_tr.get_ticket_audit_logs(action=db.AUDIT_ACTION_TICKET_REOPEN)
+            assert len(reopen_logs) >= 1, "应有1条重开审计日志"
+
+            r88.ok()
+            print(f"  [PASS] {r88.name}")
+        except Exception as e:
+            r88.fail(str(e))
+            print(f"  [FAIL] {r88.name}: {e}")
+
+        r89 = TestResult("测试89: CLI ticket 命令输出与文档对齐")
+        results.append(r89)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+
+            runner = CliRunner()
+            ticket_db8 = os.path.join(tmpdir, "ticket_cli.db")
+            svc_cli = PipelineService(ticket_db8)
+            svc_cli.create_batch("cli_ticket_batch", SAMPLE_CSV)
+
+            res_create = runner.invoke(cli, [
+                "--db", ticket_db8, "ticket", "create",
+                "CLI测试工单", "--batch-id", "1", "--trigger-rule", "baseline_block"
+            ])
+            assert res_create.exit_code == 0, f"create 失败: {res_create.output}"
+            assert "[OK]" in res_create.output
+            assert "工单已创建" in res_create.output
+            assert "标题" in res_create.output
+            assert "CLI测试工单" in res_create.output
+
+            import re
+            cli_tid = None
+            for line in res_create.output.split("\n"):
+                m = re.search(r"工单ID:\s*(\d+)", line)
+                if m:
+                    cli_tid = int(m.group(1))
+                    break
+            assert cli_tid is not None, "无法从create输出解析工单ID"
+
+            res_list = runner.invoke(cli, ["--db", ticket_db8, "ticket", "list"])
+            assert res_list.exit_code == 0, f"list 失败: {res_list.output}"
+            assert "ID" in res_list.output or "标题" in res_list.output
+
+            res_show = runner.invoke(cli, ["--db", ticket_db8, "ticket", "show", str(cli_tid)])
+            assert res_show.exit_code == 0, f"show 失败: {res_show.output}"
+            assert "工单 #" in res_show.output
+            assert "状态" in res_show.output
+            assert "备注时间线" in res_show.output
+
+            res_assign = runner.invoke(cli, [
+                "--db", ticket_db8, "ticket", "assign",
+                str(cli_tid), "alice"
+            ])
+            assert res_assign.exit_code == 0, f"assign 失败: {res_assign.output}"
+            assert "[OK]" in res_assign.output
+            assert "已分配" in res_assign.output
+
+            res_resolve = runner.invoke(cli, [
+                "--db", ticket_db8, "ticket", "resolve",
+                str(cli_tid), "已修复"
+            ])
+            assert res_resolve.exit_code == 0, f"resolve 失败: {res_resolve.output}"
+            assert "[OK]" in res_resolve.output
+            assert "已关闭" in res_resolve.output
+
+            res_reopen = runner.invoke(cli, [
+                "--db", ticket_db8, "ticket", "reopen",
+                str(cli_tid), "问题复现"
+            ])
+            assert res_reopen.exit_code == 0, f"reopen 失败: {res_reopen.output}"
+            assert "[OK]" in res_reopen.output
+            assert "重新打开" in res_reopen.output
+
+            export_file = os.path.join(tmpdir, "cli_ticket_export.json")
+            res_export = runner.invoke(cli, [
+                "--db", ticket_db8, "ticket", "export",
+                str(cli_tid), "-o", export_file
+            ])
+            assert res_export.exit_code == 0, f"export 失败: {res_export.output}"
+            assert "[OK]" in res_export.output
+            assert "已导出" in res_export.output
+            assert os.path.exists(export_file)
+
+            with open(export_file, "r", encoding="utf-8") as ef:
+                export_data = json.load(ef)
+            assert "title" in export_data
+            assert "notes" in export_data
+            assert len(export_data["notes"]) >= 3, "导出应含处理历史"
+
+            res_import = runner.invoke(cli, [
+                "--db", ticket_db8, "ticket", "import",
+                export_file, "--on-conflict", "rename"
+            ])
+            assert res_import.exit_code == 0, f"import 失败: {res_import.output}"
+            assert "导入" in res_import.output or "重命名" in res_import.output
+
+            res_list_assignee = runner.invoke(cli, [
+                "--db", ticket_db8, "ticket", "list", "--assignee", "alice"
+            ])
+            assert res_list_assignee.exit_code == 0
+
+            r89.ok()
+            print(f"  [PASS] {r89.name}")
+        except Exception as e:
+            r89.fail(str(e))
+            print(f"  [FAIL] {r89.name}: {e}")
 
         # ====== 汇总 ======
         print()

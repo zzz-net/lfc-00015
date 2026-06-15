@@ -8,7 +8,8 @@ from tabulate import tabulate
 from .service import (
     PipelineService, BatchServiceError, BatchLockedError,
     SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult,
-    SchemeDeriveResult, DryRunResult, DryRunRisk, SwitchSchemeResult
+    SchemeDeriveResult, DryRunResult, DryRunRisk, SwitchSchemeResult,
+    TicketError, TicketConflictError, TicketImportResult
 )
 from . import snapshot as snap
 from .config import get_default_config, load_config
@@ -2150,6 +2151,249 @@ def baseline_delete(ctx, baseline_id):
         click.echo(f"  基线ID:     {baseline_id}")
     except Exception as e:
         click.echo(f"{ERR} 删除失败: {e}", err=True)
+        sys.exit(1)
+
+
+# ========== 复核工单 ==========
+
+@cli.group()
+def ticket():
+    """复核工单管理（创建/列表/查看/分配/关闭/重开/导入/导出）。
+
+    把复核失败、告警过多或被基线拦住的批次直接转成可追踪任务，
+    保存来源批次和运行、触发规则、责任人、处理结论、备注时间线和当前状态。"""
+    pass
+
+
+@ticket.command("create")
+@click.argument("title")
+@click.option("--batch-id", type=int, default=None, help="来源批次 ID")
+@click.option("--run-id", type=int, default=None, help="来源运行 ID")
+@click.option("--trigger-rule", default=None, help="触发规则说明（如 baseline_block / alert_overflow）")
+@click.option("--assignee", default=None, help="责任人")
+@click.pass_context
+def ticket_create(ctx, title, batch_id, run_id, trigger_rule, assignee):
+    """创建复核工单。将复核失败、告警过多或被基线拦住的批次转成可追踪任务。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        tid = svc.create_ticket(title, source_batch_id=batch_id,
+                                source_run_id=run_id, trigger_rule=trigger_rule,
+                                assignee=assignee)
+        click.echo(f"{OK} 工单已创建")
+        click.echo(f"  工单ID:     {tid}")
+        click.echo(f"  标题:       '{title}'")
+        if batch_id:
+            click.echo(f"  来源批次:   #{batch_id}")
+        if run_id:
+            click.echo(f"  来源运行:   #{run_id}")
+        if trigger_rule:
+            click.echo(f"  触发规则:   {trigger_rule}")
+        if assignee:
+            click.echo(f"  责任人:     {assignee}")
+    except TicketConflictError as e:
+        click.echo(f"{ERR} 冲突({e.conflict_type}): {e}", err=True)
+        click.echo(f"  详情: {e.details}", err=True)
+        sys.exit(1)
+    except TicketError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+
+
+@ticket.command("list")
+@click.option("--status", type=click.Choice(["open", "assigned", "resolved", "reopened", "closed"]),
+              default=None, help="按状态筛选")
+@click.option("--assignee", default=None, help="按责任人筛选")
+@click.option("--batch-id", type=int, default=None, help="按来源批次筛选")
+@click.pass_context
+def ticket_list(ctx, status, assignee, batch_id):
+    """列出复核工单，支持按状态、责任人、来源批次筛选。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        tickets = svc.list_tickets(status=status, assignee=assignee,
+                                   source_batch_id=batch_id)
+        if not tickets:
+            click.echo("(暂无工单)")
+            return
+        status_labels = {
+            "open": "待处理", "assigned": "已分配",
+            "resolved": "已关闭", "reopened": "已重开", "closed": "已结束"
+        }
+        rows = []
+        for t in tickets:
+            rows.append({
+                "ID": t["id"],
+                "标题": t["title"],
+                "状态": status_labels.get(t["status"], t["status"]),
+                "责任人": t.get("assignee") or "-",
+                "来源批次": f"#{t['source_batch_id']}" if t.get("source_batch_id") else "-",
+                "触发规则": t.get("trigger_rule") or "-",
+                "处理结论": t.get("resolution") or "-",
+                "更新时间": t["updated_at"][:19]
+            })
+        _print_table(rows)
+    except TicketError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+
+
+@ticket.command("show")
+@click.argument("ticket_id", type=int)
+@click.pass_context
+def ticket_show(ctx, ticket_id):
+    """显示工单详情，包含来源信息、状态、处理结论和完整备注时间线。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        t = svc.get_ticket(ticket_id)
+        if not t:
+            click.echo(f"{ERR} 工单不存在: {ticket_id}", err=True)
+            sys.exit(1)
+
+        status_labels = {
+            "open": "待处理", "assigned": "已分配",
+            "resolved": "已关闭", "reopened": "已重开", "closed": "已结束"
+        }
+        note_type_labels = {
+            "comment": "备注", "assign": "分配",
+            "resolve": "关闭", "reopen": "重开",
+            "status_change": "状态变更"
+        }
+
+        click.echo(f"=== 工单 #{t['id']} ===")
+        click.echo(f"  标题:       {t['title']}")
+        click.echo(f"  状态:       {status_labels.get(t['status'], t['status'])}")
+        click.echo(f"  责任人:     {t.get('assignee') or '(未分配)'}")
+        click.echo(f"  来源批次:   #{t['source_batch_id']}" if t.get("source_batch_id") else "  来源批次:   (无)")
+        click.echo(f"  来源运行:   #{t['source_run_id']}" if t.get("source_run_id") else "  来源运行:   (无)")
+        click.echo(f"  触发规则:   {t.get('trigger_rule') or '(无)'}")
+        click.echo(f"  处理结论:   {t.get('resolution') or '(无)'}")
+        if t.get("original_ticket_id"):
+            click.echo(f"  原始工单ID: #{t['original_ticket_id']}")
+        if t.get("imported_from"):
+            click.echo(f"  导入来源:   {t['imported_from']}")
+        click.echo(f"  创建时间:   {t['created_at'][:19]}")
+        click.echo(f"  更新时间:   {t['updated_at'][:19]}")
+
+        notes = svc.get_ticket_notes(ticket_id)
+        if notes:
+            click.echo(f"\n--- 备注时间线 ({len(notes)} 条) ---")
+            for n in notes:
+                ntype = note_type_labels.get(n["note_type"], n["note_type"])
+                author = n.get("author") or "(系统)"
+                click.echo(f"  [{n['created_at'][:19]}] [{ntype}] {author}: {n['content']}")
+        else:
+            click.echo("\n--- 备注时间线: (无) ---")
+    except TicketError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+
+
+@ticket.command("assign")
+@click.argument("ticket_id", type=int)
+@click.argument("assignee")
+@click.pass_context
+def ticket_assign(ctx, ticket_id, assignee):
+    """分配工单给指定责任人。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        svc.assign_ticket(ticket_id, assignee)
+        click.echo(f"{OK} 工单已分配")
+        click.echo(f"  工单ID:     {ticket_id}")
+        click.echo(f"  责任人:     {assignee}")
+    except TicketError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+
+
+@ticket.command("resolve")
+@click.argument("ticket_id", type=int)
+@click.argument("resolution")
+@click.option("--assignee", default=None, help="关闭人（默认沿用当前责任人）")
+@click.pass_context
+def ticket_resolve(ctx, ticket_id, resolution, assignee):
+    """关闭工单，记录处理结论。只有待处理/已分配/已重开状态的工单可关闭。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        svc.resolve_ticket(ticket_id, resolution, assignee=assignee)
+        click.echo(f"{OK} 工单已关闭")
+        click.echo(f"  工单ID:     {ticket_id}")
+        click.echo(f"  处理结论:   {resolution}")
+    except TicketError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+
+
+@ticket.command("reopen")
+@click.argument("ticket_id", type=int)
+@click.argument("reason")
+@click.pass_context
+def ticket_reopen(ctx, ticket_id, reason):
+    """重新打开已关闭的工单，说明原因。只有已关闭状态的工单可重新打开。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        svc.reopen_ticket(ticket_id, reason)
+        click.echo(f"{OK} 工单已重新打开")
+        click.echo(f"  工单ID:     {ticket_id}")
+        click.echo(f"  原因:       {reason}")
+    except TicketError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+
+
+@ticket.command("export")
+@click.argument("ticket_id", type=int)
+@click.option("--output", "-o", required=True, type=click.Path(), help="输出 JSON 文件路径")
+@click.pass_context
+def ticket_export(ctx, ticket_id, output):
+    """导出工单为 JSON 文件（含完整处理历史）。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        path = svc.export_ticket(ticket_id, output)
+        click.echo(f"{OK} 工单已导出")
+        click.echo(f"  工单ID:     {ticket_id}")
+        click.echo(f"  文件路径:   {path}")
+    except TicketError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+
+
+@ticket.command("import")
+@click.argument("file_path", type=click.Path(exists=True))
+@click.option("--on-conflict", type=click.Choice(["reject", "rename"]),
+              default=None, help="冲突处理策略: reject=拒绝, rename=自动重命名")
+@click.option("--new-title", default=None, help="重命名时使用的新标题")
+@click.pass_context
+def ticket_import(ctx, file_path, on_conflict, new_title):
+    """从 JSON 文件导入工单（含处理历史）。遇到同标题冲突时支持 reject 和 rename。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.import_ticket(file_path, on_conflict=on_conflict,
+                                   new_title=new_title)
+        if result.success:
+            action_label = {
+                None: "导入", "rename": "重命名导入"
+            }.get(result.action, "导入")
+            click.echo(f"{OK} {action_label}成功")
+            click.echo(f"  工单ID:     {result.ticket_id}")
+            if result.original_title and result.original_title != result.final_title:
+                click.echo(f"  原始标题:   {result.original_title}")
+                click.echo(f"  落地标题:   {result.final_title}")
+            else:
+                click.echo(f"  标题:       '{result.final_title}'")
+            if result.original_ticket_id:
+                click.echo(f"  原始工单ID: #{result.original_ticket_id}")
+            if result.imported_from:
+                click.echo(f"  导入来源:   {result.imported_from}")
+        else:
+            click.echo(f"  已拒绝: {result.message}")
+            if result.original_title:
+                click.echo(f"  原始标题:   {result.original_title}")
+    except TicketConflictError as e:
+        click.echo(f"{ERR} 导入冲突 ({e.conflict_type}): {e}", err=True)
+        click.echo(f"  详情: {e.details}", err=True)
+        click.echo("  提示: 使用 --on-conflict reject/rename 自动处理", err=True)
+        sys.exit(1)
+    except TicketError as e:
+        click.echo(f"{ERR} {e}", err=True)
         sys.exit(1)
 
 

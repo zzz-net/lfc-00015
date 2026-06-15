@@ -250,6 +250,40 @@ def init_db(db_path: str = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_baseline_checks_baseline_id ON baseline_checks(baseline_id);
             CREATE INDEX IF NOT EXISTS idx_baseline_checks_status ON baseline_checks(check_status);
             CREATE INDEX IF NOT EXISTS idx_baseline_checks_target_batch ON baseline_checks(target_batch_id);
+
+            CREATE TABLE IF NOT EXISTS review_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                source_batch_id INTEGER,
+                source_run_id INTEGER,
+                trigger_rule TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                assignee TEXT,
+                resolution TEXT,
+                original_ticket_id INTEGER,
+                imported_from TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (source_batch_id) REFERENCES batches(id) ON DELETE SET NULL,
+                FOREIGN KEY (source_run_id) REFERENCES runs(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_review_tickets_status ON review_tickets(status);
+            CREATE INDEX IF NOT EXISTS idx_review_tickets_assignee ON review_tickets(assignee);
+            CREATE INDEX IF NOT EXISTS idx_review_tickets_batch_id ON review_tickets(source_batch_id);
+            CREATE INDEX IF NOT EXISTS idx_review_tickets_title ON review_tickets(title);
+
+            CREATE TABLE IF NOT EXISTS ticket_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                author TEXT,
+                note_type TEXT NOT NULL DEFAULT 'comment',
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES review_tickets(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ticket_notes_ticket_id ON ticket_notes(ticket_id);
         """)
         conn.commit()
 
@@ -1473,13 +1507,186 @@ def add_baseline_audit_log(conn: sqlite3.Connection, action: str,
 def get_baseline_audit_logs(conn: sqlite3.Connection, baseline_id: int = None,
                             action: str = None, result: str = None,
                             limit: int = 100) -> List[Dict[str, Any]]:
-    """查询基线审计日志，支持按基线、操作类型、结果筛选"""
     cursor = conn.cursor()
     query = "SELECT * FROM scheme_audit_log WHERE 1=1"
     params = []
     if baseline_id is not None:
         query += " AND baseline_id = ?"
         params.append(baseline_id)
+    if action is not None:
+        query += " AND action = ?"
+        params.append(action)
+    if result is not None:
+        query += " AND result = ?"
+        params.append(result)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, params)
+    results = []
+    for row in cursor.fetchall():
+        r = dict(row)
+        if r.get("previous_config_json"):
+            r["previous_config"] = json.loads(r["previous_config_json"])
+            del r["previous_config_json"]
+        else:
+            r.pop("previous_config_json", None)
+        if r.get("new_config_json"):
+            r["new_config"] = json.loads(r["new_config_json"])
+            del r["new_config_json"]
+        else:
+            r.pop("new_config_json", None)
+        if r.get("config_diff_json"):
+            r["config_diff"] = json.loads(r["config_diff_json"])
+            del r["config_diff_json"]
+        else:
+            r.pop("config_diff_json", None)
+        results.append(r)
+    return results
+
+
+TICKET_STATUS_OPEN = "open"
+TICKET_STATUS_ASSIGNED = "assigned"
+TICKET_STATUS_RESOLVED = "resolved"
+TICKET_STATUS_REOPENED = "reopened"
+TICKET_STATUS_CLOSED = "closed"
+
+TICKET_NOTE_COMMENT = "comment"
+TICKET_NOTE_ASSIGN = "assign"
+TICKET_NOTE_RESOLVE = "resolve"
+TICKET_NOTE_REOPEN = "reopen"
+TICKET_NOTE_STATUS_CHANGE = "status_change"
+
+AUDIT_ACTION_TICKET_CREATE = "ticket_create"
+AUDIT_ACTION_TICKET_ASSIGN = "ticket_assign"
+AUDIT_ACTION_TICKET_RESOLVE = "ticket_resolve"
+AUDIT_ACTION_TICKET_REOPEN = "ticket_reopen"
+AUDIT_ACTION_TICKET_EXPORT = "ticket_export"
+AUDIT_ACTION_TICKET_IMPORT = "ticket_import"
+
+TICKET_IMPORT_FORMAT_VERSION = "1.0"
+
+
+def create_ticket(conn: sqlite3.Connection, title: str,
+                  source_batch_id: int = None, source_run_id: int = None,
+                  trigger_rule: str = None, assignee: str = None,
+                  original_ticket_id: int = None,
+                  imported_from: str = None) -> int:
+    now = datetime.now().isoformat()
+    status = TICKET_STATUS_ASSIGNED if assignee else TICKET_STATUS_OPEN
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO review_tickets (
+            title, source_batch_id, source_run_id, trigger_rule,
+            status, assignee, resolution,
+            original_ticket_id, imported_from,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (title, source_batch_id, source_run_id, trigger_rule,
+          status, assignee, None,
+          original_ticket_id, imported_from,
+          now, now))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_ticket(conn: sqlite3.Connection, ticket_id: int) -> Optional[Dict[str, Any]]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM review_tickets WHERE id = ?", (ticket_id,))
+    row = cursor.fetchone()
+    return dict(row) if row else None
+
+
+def get_ticket_by_title(conn: sqlite3.Connection, title: str) -> Optional[Dict[str, Any]]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM review_tickets WHERE title = ?", (title,))
+    row = cursor.fetchone()
+    return dict(row) if row else None
+
+
+def list_tickets(conn: sqlite3.Connection, status: str = None,
+                 assignee: str = None,
+                 source_batch_id: int = None,
+                 limit: int = 100) -> List[Dict[str, Any]]:
+    cursor = conn.cursor()
+    query = "SELECT * FROM review_tickets WHERE 1=1"
+    params = []
+    if status is not None:
+        query += " AND status = ?"
+        params.append(status)
+    if assignee is not None:
+        query += " AND assignee = ?"
+        params.append(assignee)
+    if source_batch_id is not None:
+        query += " AND source_batch_id = ?"
+        params.append(source_batch_id)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, params)
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def update_ticket_status(conn: sqlite3.Connection, ticket_id: int,
+                         status: str, assignee: str = None,
+                         resolution: str = None) -> None:
+    now = datetime.now().isoformat()
+    if assignee is not None and resolution is not None:
+        conn.execute("""
+            UPDATE review_tickets SET status = ?, assignee = ?, resolution = ?, updated_at = ?
+            WHERE id = ?
+        """, (status, assignee, resolution, now, ticket_id))
+    elif assignee is not None:
+        conn.execute("""
+            UPDATE review_tickets SET status = ?, assignee = ?, updated_at = ?
+            WHERE id = ?
+        """, (status, assignee, now, ticket_id))
+    elif resolution is not None:
+        conn.execute("""
+            UPDATE review_tickets SET status = ?, resolution = ?, updated_at = ?
+            WHERE id = ?
+        """, (status, resolution, now, ticket_id))
+    else:
+        conn.execute("""
+            UPDATE review_tickets SET status = ?, updated_at = ?
+            WHERE id = ?
+        """, (status, now, ticket_id))
+    conn.commit()
+
+
+def update_ticket_title(conn: sqlite3.Connection, ticket_id: int, title: str) -> None:
+    now = datetime.now().isoformat()
+    conn.execute("UPDATE review_tickets SET title = ?, updated_at = ? WHERE id = ?",
+                 (title, now, ticket_id))
+    conn.commit()
+
+
+def add_ticket_note(conn: sqlite3.Connection, ticket_id: int,
+                    content: str, author: str = None,
+                    note_type: str = TICKET_NOTE_COMMENT) -> int:
+    now = datetime.now().isoformat()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO ticket_notes (ticket_id, author, note_type, content, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (ticket_id, author, note_type, content, now))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_ticket_notes(conn: sqlite3.Connection, ticket_id: int) -> List[Dict[str, Any]]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM ticket_notes WHERE ticket_id = ? ORDER BY id ASC",
+                   (ticket_id,))
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def get_ticket_audit_logs(conn: sqlite3.Connection, ticket_id: int = None,
+                          action: str = None, result: str = None,
+                          limit: int = 100) -> List[Dict[str, Any]]:
+    cursor = conn.cursor()
+    query = "SELECT * FROM scheme_audit_log WHERE 1=1"
+    params = []
+    if ticket_id is not None:
+        query += " AND action LIKE 'ticket_%'"
     if action is not None:
         query += " AND action = ?"
         params.append(action)
