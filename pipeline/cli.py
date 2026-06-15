@@ -66,12 +66,14 @@ def list_batches(ctx):
         return
     rows = []
     for b in batches:
+        scheme_info = f"#{b['current_scheme_id']}" if b.get("current_scheme_id") else "-"
         rows.append({
             "ID": b["id"],
             "名称": b["name"],
             "状态": b["status"],
             "锁定": "是" if b["locked"] else "否",
             "配置版本": b["config_version"],
+            "当前方案": scheme_info,
             "源文件": os.path.basename(b["source_file"]),
             "更新时间": b["updated_at"][:19]
         })
@@ -94,6 +96,10 @@ def show_batch(ctx, batch_id):
     click.echo(f"  状态:       {batch['status']}")
     click.echo(f"  锁定:       {'是' if batch['locked'] else '否'}")
     click.echo(f"  配置版本:   {batch['config_version']}")
+    if batch.get("current_scheme_id"):
+        click.echo(f"  当前方案:   #{batch['current_scheme_id']} {batch.get('current_scheme_name') or ''}")
+    else:
+        click.echo(f"  当前方案:   (无)")
     click.echo(f"  源文件:     {batch['source_file']}")
     click.echo(f"  创建时间:   {batch['created_at']}")
     click.echo(f"  更新时间:   {batch['updated_at']}")
@@ -618,6 +624,81 @@ def scheme_derive_apply(ctx, source_scheme_id, new_name, batch_id, description):
         sys.exit(1)
     except SchemeError as e:
         click.echo(f"{ERR} 方案错误: {e}", err=True)
+        sys.exit(1)
+    except BatchServiceError as e:
+        click.echo(f"{ERR} 批次错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("history")
+@click.argument("batch_id", type=int)
+@click.pass_context
+def scheme_history(ctx, batch_id):
+    """查看批次的方案应用/回滚历史记录"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        history = svc.get_scheme_history(batch_id)
+        if not history:
+            click.echo("(暂无方案历史记录)")
+            return
+        rows = []
+        for h in history:
+            action_label = {
+                "apply": "应用",
+                "rollback": "回滚",
+                "direct": "直接修改"
+            }.get(h["action"], h["action"])
+            scheme_info = ""
+            if h.get("scheme_id"):
+                scheme_info = f"#{h['scheme_id']} {h.get('scheme_name') or ''}"
+            else:
+                scheme_info = "(无方案)"
+            source_info = ""
+            if h.get("source_scheme_id"):
+                source_info = f"来源#{h['source_scheme_id']}"
+            rows.append({
+                "ID": h["id"],
+                "操作": action_label,
+                "方案": scheme_info.strip(),
+                "来源": source_info,
+                "配置版本": f"v{h['config_version']}",
+                "回滚自": f"#{h['rolled_back_from_id']}" if h.get("rolled_back_from_id") else "-",
+                "时间": h["applied_at"][:19]
+            })
+        _print_table(rows)
+    except BatchServiceError as e:
+        click.echo(f"{ERR} 批次错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("rollback")
+@click.argument("batch_id", type=int)
+@click.pass_context
+def scheme_rollback(ctx, batch_id):
+    """回滚批次到上一个配置版本（撤销最近一次方案应用或修改）。
+
+    锁定批次拒绝回滚，回滚后配置版本号递增（回滚本身也是一次变更）。
+    回滚操作会记录到历史中，可追溯。
+    成功后终端输出：原配置版本、新配置版本、回滚到的方案信息。
+    日志位置：Logger=pipeline.service，级别=INFO。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.rollback_scheme(batch_id)
+        if result.success:
+            click.echo(f"{OK} 配置回滚成功")
+            click.echo(f"  批次:       ID={batch_id}")
+            click.echo(f"  原版本:     v{result.previous_config_version}")
+            click.echo(f"  新版本:     v{result.new_config_version}")
+            if result.previous_scheme_id:
+                click.echo(f"  回滚到方案: ID={result.previous_scheme_id}, 名称='{result.previous_scheme_name}'")
+            else:
+                click.echo(f"  回滚到方案: (无方案关联的配置版本)")
+            click.echo("  请执行 process 命令以使用回滚后的配置重跑该批次。")
+        else:
+            click.echo(f"{ERR} 无法回滚: {result.message}", err=True)
+            sys.exit(1)
+    except BatchLockedError as e:
+        click.echo(f"{ERR} {e}", err=True)
         sys.exit(1)
     except BatchServiceError as e:
         click.echo(f"{ERR} 批次错误: {e}", err=True)

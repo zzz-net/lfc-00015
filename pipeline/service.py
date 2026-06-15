@@ -1,6 +1,7 @@
 """批次管理服务 - 状态流转、锁定保护、重跑机制、行级错误处理"""
 import os
 import json
+import copy
 import sqlite3
 import logging
 from datetime import datetime
@@ -105,6 +106,23 @@ class SchemeDeriveResult:
         self.message = message
 
 
+class SchemeRollbackResult:
+    """方案回滚结果"""
+
+    def __init__(self, success: bool, batch_id: int = None,
+                 previous_config_version: int = None, new_config_version: int = None,
+                 previous_scheme_id: int = None, previous_scheme_name: str = None,
+                 rolled_back_from_history_id: int = None, message: str = None):
+        self.success = success
+        self.batch_id = batch_id
+        self.previous_config_version = previous_config_version
+        self.new_config_version = new_config_version
+        self.previous_scheme_id = previous_scheme_id
+        self.previous_scheme_name = previous_scheme_name
+        self.rolled_back_from_history_id = rolled_back_from_history_id
+        self.message = message
+
+
 class PipelineService:
     """流水线服务类"""
 
@@ -153,7 +171,7 @@ class PipelineService:
     # ========== 配置管理 ==========
 
     def update_config(self, batch_id: int, new_config: Dict[str, Any]) -> Dict[str, Any]:
-        """更新批次配置（版本号自动递增）"""
+        """更新批次配置（版本号自动递增），记录历史（direct 操作）"""
         conn = self._conn()
         try:
             batch = db.get_batch(conn, batch_id)
@@ -164,6 +182,17 @@ class PipelineService:
 
             updated_cfg = bump_config_version(new_config)
             db.update_batch_config(conn, batch_id, updated_cfg)
+
+            db.add_scheme_history(
+                conn, batch_id, updated_cfg,
+                action=db.SCHEME_HISTORY_ACTION_DIRECT,
+                scheme_id=batch.get("current_scheme_id"),
+                scheme_name=batch.get("current_scheme_name")
+            )
+            logger.info(
+                f"配置已更新(direct): batch_id={batch_id}, "
+                f"new_config_version={updated_cfg['version']}"
+            )
             return updated_cfg
         finally:
             conn.close()
@@ -565,6 +594,7 @@ class PipelineService:
         """
         将方案配置应用到批次（返回新配置，不自动重跑）。
         锁定批次不允许修改配置。
+        记录应用历史，更新批次当前方案信息。
         """
         conn = self._conn()
         try:
@@ -581,10 +611,111 @@ class PipelineService:
                     f"而不要修改已锁定批次的历史配置。"
                 )
             new_cfg = bump_config_version(scheme["config"])
-            db.update_batch_config(conn, batch_id, new_cfg)
-            logger.info(f"方案已应用到批次: scheme_id={scheme_id}, scheme_name='{scheme['name']}', "
-                        f"batch_id={batch_id}, new_config_version={new_cfg['version']}")
+            db.update_batch_config(conn, batch_id, new_cfg,
+                                   scheme_id=scheme_id, scheme_name=scheme["name"])
+
+            db.add_scheme_history(
+                conn, batch_id, new_cfg,
+                action=db.SCHEME_HISTORY_ACTION_APPLY,
+                scheme_id=scheme_id, scheme_name=scheme["name"],
+                source_scheme_id=scheme.get("source_scheme_id")
+            )
+            logger.info(
+                f"方案已应用到批次: scheme_id={scheme_id}, scheme_name='{scheme['name']}', "
+                f"batch_id={batch_id}, new_config_version={new_cfg['version']}, "
+                f"source_scheme_id={scheme.get('source_scheme_id')}"
+            )
             return new_cfg
+        finally:
+            conn.close()
+
+    def get_scheme_history(self, batch_id: int) -> List[Dict[str, Any]]:
+        """获取批次的方案应用历史"""
+        conn = self._conn()
+        try:
+            batch = db.get_batch(conn, batch_id)
+            if not batch:
+                raise BatchServiceError(f"批次不存在: {batch_id}")
+            return db.get_scheme_history(conn, batch_id)
+        finally:
+            conn.close()
+
+    def rollback_scheme(self, batch_id: int) -> SchemeRollbackResult:
+        """
+        回滚批次的配置到上一个版本。
+        - 锁定批次不允许回滚
+        - 如果没有历史记录，返回失败
+        - 回滚后配置版本号递增（回滚也是一次配置变更）
+        - 回滚操作本身也会记录到历史中
+        """
+        conn = self._conn()
+        try:
+            batch = db.get_batch(conn, batch_id)
+            if not batch:
+                raise BatchServiceError(f"批次不存在: {batch_id}")
+            if db.is_batch_locked(conn, batch_id):
+                raise BatchLockedError(
+                    f"批次 {batch_id} 已锁定，无法回滚配置。"
+                    f"如需回滚，请先执行 unlock 解锁。"
+                )
+
+            latest_history = db.get_latest_scheme_history(conn, batch_id)
+            if not latest_history:
+                return SchemeRollbackResult(
+                    success=False, batch_id=batch_id,
+                    message="没有可回滚的历史记录"
+                )
+
+            previous_history = db.get_previous_scheme_history(
+                conn, batch_id, latest_history["id"]
+            )
+
+            if not previous_history:
+                return SchemeRollbackResult(
+                    success=False, batch_id=batch_id,
+                    message="已经是最早的配置版本，无法再回滚"
+                )
+
+            previous_cfg = previous_history["config"]
+            current_version = latest_history["config_version"]
+            rolled_back_cfg = copy.deepcopy(previous_cfg)
+            rolled_back_cfg["version"] = current_version + 1
+
+            db.update_batch_config(
+                conn, batch_id, rolled_back_cfg,
+                scheme_id=previous_history.get("scheme_id"),
+                scheme_name=previous_history.get("scheme_name")
+            )
+
+            db.add_scheme_history(
+                conn, batch_id, rolled_back_cfg,
+                action=db.SCHEME_HISTORY_ACTION_ROLLBACK,
+                scheme_id=previous_history.get("scheme_id"),
+                scheme_name=previous_history.get("scheme_name"),
+                source_scheme_id=previous_history.get("source_scheme_id"),
+                rolled_back_from_id=latest_history["id"]
+            )
+
+            result = SchemeRollbackResult(
+                success=True,
+                batch_id=batch_id,
+                previous_config_version=latest_history["config_version"],
+                new_config_version=rolled_back_cfg["version"],
+                previous_scheme_id=previous_history.get("scheme_id"),
+                previous_scheme_name=previous_history.get("scheme_name"),
+                rolled_back_from_history_id=latest_history["id"],
+                message=f"已回滚到配置版本 v{rolled_back_cfg['version']}"
+            )
+
+            logger.info(
+                f"方案已回滚: batch_id={batch_id}, "
+                f"from_version={latest_history['config_version']}, "
+                f"to_version={rolled_back_cfg['version']}, "
+                f"scheme_id={previous_history.get('scheme_id')}, "
+                f"scheme_name='{previous_history.get('scheme_name')}'"
+            )
+
+            return result
         finally:
             conn.close()
 
@@ -690,10 +821,19 @@ class PipelineService:
             )
 
             new_cfg = bump_config_version(config)
-            db.update_batch_config(conn, batch_id, new_cfg)
+            db.update_batch_config(conn, batch_id, new_cfg,
+                                   scheme_id=cloned_id, scheme_name=new_name)
+
+            db.add_scheme_history(
+                conn, batch_id, new_cfg,
+                action=db.SCHEME_HISTORY_ACTION_APPLY,
+                scheme_id=cloned_id, scheme_name=new_name,
+                source_scheme_id=source_scheme_id
+            )
             logger.info(
                 f"克隆方案已应用到批次: scheme_id={cloned_id}, scheme_name='{new_name}', "
-                f"batch_id={batch_id}, new_config_version={new_cfg['version']}"
+                f"batch_id={batch_id}, new_config_version={new_cfg['version']}, "
+                f"source_scheme_id={source_scheme_id}"
             )
 
             return SchemeCloneResult(
@@ -873,7 +1013,15 @@ class PipelineService:
             )
 
             new_cfg = bump_config_version(config)
-            db.update_batch_config(conn, batch_id, new_cfg)
+            db.update_batch_config(conn, batch_id, new_cfg,
+                                   scheme_id=derived_id, scheme_name=new_name)
+
+            db.add_scheme_history(
+                conn, batch_id, new_cfg,
+                action=db.SCHEME_HISTORY_ACTION_APPLY,
+                scheme_id=derived_id, scheme_name=new_name,
+                source_scheme_id=source_scheme_id
+            )
             logger.info(
                 f"派生并应用步骤7-应用到批次: derived_id={derived_id}, "
                 f"derived_name='{new_name}', batch_id={batch_id}, "

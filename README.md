@@ -90,6 +90,8 @@ python -m pipeline scheme --help
 | `scheme clone-apply SOURCE_SCHEME_ID NEW_NAME BATCH_ID [--description TEXT]` | 克隆方案并立即应用到未锁定批次（不自动重跑） |
 | `scheme derive SOURCE_SCHEME_ID NEW_NAME [--description TEXT]` | 基于已有方案派生出新方案，记录来源关系（source_scheme_id） |
 | `scheme derive-apply SOURCE_SCHEME_ID NEW_NAME BATCH_ID [--description TEXT]` | 派生方案并立即应用到未锁定批次，7步校验+步骤级日志 |
+| `scheme history BATCH_ID` | 查看批次的方案应用/回滚历史记录 |
+| `scheme rollback BATCH_ID` | 回滚批次到上一个配置版本（撤销最近一次方案应用或修改） |
 | `scheme export SCHEME_ID -o FILE.json` | 导出方案为 JSON 文件 |
 | `scheme import FILE.json [--on-conflict ask\|overwrite\|rename\|skip] [--new-name NAME]` | 从文件导入方案 |
 | `scheme delete SCHEME_ID` | 删除方案 |
@@ -208,6 +210,8 @@ python -m pipeline compare --help
 | `scheme apply` | 1 | scheme_id、scheme_name、batch_id、new_config_version |
 | `scheme clone` | 1 | source_id、source_name、cloned_id、cloned_name |
 | `scheme clone-apply` | 2 | 克隆一条（含链路标记）+ 应用一条（含 scheme_id、scheme_name、batch_id、new_config_version） |
+| `scheme derive` | 4 | 每步校验1条 + 创建1条（含 source_id、source_name、derived_id、derived_name） |
+| `scheme derive-apply` | 7 | 每步校验/操作1条，含步骤编号和 result（通过/失败/成功），失败日志含失败步骤 |
 | `compare run` | 1 | id、name、scheme、batch_ids |
 
 方案克隆链路的日志样例见上文"方案克隆与应用链路使用说明 → 日志定位"。

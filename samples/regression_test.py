@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pipeline.service import (
     PipelineService, BatchLockedError, BatchServiceError,
     SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult,
-    SchemeDeriveResult
+    SchemeDeriveResult, SchemeRollbackResult
 )
 from pipeline import database as db
 from pipeline.processor import import_csv
@@ -1399,6 +1399,402 @@ def run_tests():
         except Exception as e:
             r28.fail(str(e))
             print(f"  [FAIL] {r28.name}: {e}")
+
+        # ====== 测试 29: 方案应用后批次当前方案信息 + 历史记录 ======
+        r29 = TestResult("测试29: 方案应用后批次 current_scheme 正确，历史记录生成，含来源方案")
+        results.append(r29)
+        try:
+            svc_h1 = PipelineService(db_path)
+
+            h_base_bid = svc_h1.create_batch("hist_base_batch", SAMPLE_CSV)
+            svc_h1.process_batch(h_base_bid)
+            h_src_sid = svc_h1.save_scheme("hist_source", batch_id=h_base_bid, description="历史测试源")
+
+            h_derived_sid = svc_h1.derive_scheme(h_src_sid, "hist_derived", "历史测试派生")
+
+            h_target_bid = svc_h1.create_batch("hist_target_batch", SAMPLE_CSV)
+            svc_h1.process_batch(h_target_bid)
+
+            new_cfg = svc_h1.apply_scheme_to_batch(h_derived_sid, h_target_bid)
+
+            batch_after = svc_h1.get_batch(h_target_bid)
+            assert batch_after["current_scheme_id"] == h_derived_sid, \
+                f"批次 current_scheme_id 应为 {h_derived_sid}，实际 {batch_after.get('current_scheme_id')}"
+            assert batch_after["current_scheme_name"] == "hist_derived", \
+                f"批次 current_scheme_name 应为 'hist_derived'，实际 {batch_after.get('current_scheme_name')}"
+            assert batch_after["config_version"] == new_cfg["version"]
+
+            history = svc_h1.get_scheme_history(h_target_bid)
+            assert len(history) >= 1, f"至少应有 1 条历史记录，实际 {len(history)}"
+            latest = history[0]
+            assert latest["action"] == "apply", f"最新历史操作应为 apply，实际 {latest['action']}"
+            assert latest["scheme_id"] == h_derived_sid, \
+                f"历史记录 scheme_id 应为 {h_derived_sid}，实际 {latest.get('scheme_id')}"
+            assert latest["source_scheme_id"] == h_src_sid, \
+                f"历史记录 source_scheme_id 应为 {h_src_sid}，实际 {latest.get('source_scheme_id')}"
+            assert latest["config_version"] == new_cfg["version"]
+
+            r29.ok()
+            print(f"  [PASS] {r29.name}  (hist_count={len(history)}, scheme_id={h_derived_sid})")
+        except Exception as e:
+            r29.fail(str(e))
+            print(f"  [FAIL] {r29.name}: {e}")
+
+        # ====== 测试 30: 直接修改配置（set-threshold）也记录历史 ======
+        r30 = TestResult("测试30: set-threshold 直接修改配置也记录历史，标记为 direct 操作")
+        results.append(r30)
+        try:
+            svc_h2 = PipelineService(db_path)
+
+            th_bid = svc_h2.create_batch("thresh_hist_batch", SAMPLE_CSV)
+            svc_h2.process_batch(th_bid)
+
+            hist_before = svc_h2.get_scheme_history(th_bid)
+            before_count = len(hist_before)
+
+            new_cfg = svc_h2.set_threshold(th_bid, zscore_threshold=1.5)
+
+            hist_after = svc_h2.get_scheme_history(th_bid)
+            assert len(hist_after) == before_count + 1, \
+                f"set-threshold 后应新增 1 条历史，before={before_count}, after={len(hist_after)}"
+
+            latest = hist_after[0]
+            assert latest["action"] == "direct", \
+                f"直接修改操作应为 direct，实际 {latest['action']}"
+            assert latest["config_version"] == new_cfg["version"]
+
+            r30.ok()
+            print(f"  [PASS] {r30.name}  (hist_count={len(hist_after)}, cfg_v={new_cfg['version']})")
+        except Exception as e:
+            r30.fail(str(e))
+            print(f"  [FAIL] {r30.name}: {e}")
+
+        # ====== 测试 31: 回滚功能 - 成功回滚到上一版本 ======
+        r31 = TestResult("测试31: 方案应用后回滚成功，配置版本递增，方案信息回退")
+        results.append(r31)
+        try:
+            svc_rb1 = PipelineService(db_path)
+
+            rb_base_bid = svc_rb1.create_batch("rollback_base", SAMPLE_CSV)
+            svc_rb1.process_batch(rb_base_bid)
+            rb_src_sid = svc_rb1.save_scheme("rb_source", batch_id=rb_base_bid, description="回滚测试源")
+
+            rb_target_bid = svc_rb1.create_batch("rollback_target", SAMPLE_CSV)
+            svc_rb1.process_batch(rb_target_bid)
+
+            v2_cfg = svc_rb1.apply_scheme_to_batch(rb_src_sid, rb_target_bid)
+            v2_version = v2_cfg["version"]
+
+            svc_rb1.set_threshold(rb_target_bid, zscore_threshold=2.5)
+
+            hist_before_rb = svc_rb1.get_scheme_history(rb_target_bid)
+            before_rb_count = len(hist_before_rb)
+            batch_before = svc_rb1.get_batch(rb_target_bid)
+            version_before_rb = batch_before["config_version"]
+
+            result = svc_rb1.rollback_scheme(rb_target_bid)
+            assert isinstance(result, SchemeRollbackResult)
+            assert result.success is True
+            assert result.previous_config_version == version_before_rb
+            assert result.new_config_version > version_before_rb
+            assert result.previous_scheme_id == rb_src_sid
+            assert result.previous_scheme_name == "rb_source"
+
+            batch_after = svc_rb1.get_batch(rb_target_bid)
+            assert batch_after["config_version"] == result.new_config_version
+            assert batch_after["current_scheme_id"] == rb_src_sid
+            assert batch_after["current_scheme_name"] == "rb_source"
+
+            hist_after = svc_rb1.get_scheme_history(rb_target_bid)
+            assert len(hist_after) == before_rb_count + 1, \
+                f"回滚后应新增 1 条历史，before={before_rb_count}, after={len(hist_after)}"
+            assert hist_after[0]["action"] == "rollback", \
+                f"最新历史应为 rollback，实际 {hist_after[0]['action']}"
+            assert hist_after[0]["rolled_back_from_id"] == hist_before_rb[0]["id"]
+
+            r31.ok()
+            print(f"  [PASS] {r31.name}  (from_v={version_before_rb}, to_v={result.new_config_version})")
+        except Exception as e:
+            r31.fail(str(e))
+            print(f"  [FAIL] {r31.name}: {e}")
+
+        # ====== 测试 32: 锁定批次拒绝回滚 ======
+        r32 = TestResult("测试32: 锁定批次拒绝回滚，抛出 BatchLockedError")
+        results.append(r32)
+        try:
+            svc_rb2 = PipelineService(db_path)
+
+            rb_lock_bid = svc_rb2.create_batch("rollback_locked", SAMPLE_CSV)
+            svc_rb2.process_batch(rb_lock_bid)
+            rb_lock_sid = svc_rb2.save_scheme("rb_lock_scheme", batch_id=rb_lock_bid)
+            svc_rb2.apply_scheme_to_batch(rb_lock_sid, rb_lock_bid)
+            svc_rb2.lock_batch(rb_lock_bid)
+
+            try:
+                svc_rb2.rollback_scheme(rb_lock_bid)
+                assert False, "锁定批次回滚应抛出 BatchLockedError"
+            except BatchLockedError:
+                pass
+
+            batch_after = svc_rb2.get_batch(rb_lock_bid)
+            assert batch_after["locked"] == 1
+            assert batch_after["status"] == "locked"
+
+            svc_rb2.unlock_batch(rb_lock_bid)
+
+            r32.ok()
+            print(f"  [PASS] {r32.name}  (batch={rb_lock_bid})")
+        except Exception as e:
+            r32.fail(str(e))
+            print(f"  [FAIL] {r32.name}: {e}")
+
+        # ====== 测试 33: 回滚后重新处理、重新应用走通 ======
+        r33 = TestResult("测试33: 回滚后重新 process 正常，再次应用其他方案也正常")
+        results.append(r33)
+        try:
+            svc_rb3 = PipelineService(db_path)
+
+            rrp_bid = svc_rb3.create_batch("rb_reprocess_batch", SAMPLE_CSV)
+            svc_rb3.process_batch(rrp_bid)
+            rrp_sid1 = svc_rb3.save_scheme("rrp_scheme_v1", batch_id=rrp_bid, description="方案v1")
+
+            rrp_sid2 = svc_rb3.derive_scheme(rrp_sid1, "rrp_scheme_v2", "方案v2")
+
+            svc_rb3.apply_scheme_to_batch(rrp_sid2, rrp_bid)
+            run1_id, run1_n = svc_rb3.process_batch(rrp_bid)
+            metrics_run1 = svc_rb3.get_run_metrics(run1_id)
+
+            svc_rb3.set_threshold(rrp_bid, zscore_threshold=1.2)
+
+            rb_result = svc_rb3.rollback_scheme(rrp_bid)
+            assert rb_result.success
+
+            run2_id, run2_n = svc_rb3.process_batch(rrp_bid)
+            assert run2_n == run1_n + 1
+            metrics_run2 = svc_rb3.get_run_metrics(run2_id)
+            assert len(metrics_run2) == len(metrics_run1)
+
+            svc_rb3.apply_scheme_to_batch(rrp_sid2, rrp_bid)
+            run3_id, run3_n = svc_rb3.process_batch(rrp_bid)
+            assert run3_n == run2_n + 1
+
+            r33.ok()
+            print(f"  [PASS] {r33.name}  (runs={run3_n}, rollback={rb_result.new_config_version})")
+        except Exception as e:
+            r33.fail(str(e))
+            print(f"  [FAIL] {r33.name}: {e}")
+
+        # ====== 测试 34: 重启后历史记录和当前方案信息保留 ======
+        r34 = TestResult("测试34: 重启后历史记录和当前方案信息持久化，不丢失")
+        results.append(r34)
+        try:
+            svc_pre = PipelineService(db_path)
+
+            restart_h_bid = svc_pre.create_batch("restart_hist_batch", SAMPLE_CSV)
+            svc_pre.process_batch(restart_h_bid)
+            restart_h_sid = svc_pre.save_scheme("restart_hist_scheme", batch_id=restart_h_bid)
+            svc_pre.apply_scheme_to_batch(restart_h_sid, restart_h_bid)
+            svc_pre.set_threshold(restart_h_bid, zscore_threshold=1.8)
+            svc_pre.rollback_scheme(restart_h_bid)
+
+            hist_before = svc_pre.get_scheme_history(restart_h_bid)
+            batch_before = svc_pre.get_batch(restart_h_bid)
+            expected_scheme_id = batch_before["current_scheme_id"]
+            expected_scheme_name = batch_before["current_scheme_name"]
+            expected_cfg_version = batch_before["config_version"]
+
+            del svc_pre
+
+            svc_post = PipelineService(db_path)
+
+            batch_after = svc_post.get_batch(restart_h_bid)
+            assert batch_after["current_scheme_id"] == expected_scheme_id, \
+                f"重启后 current_scheme_id 应不变，before={expected_scheme_id}, after={batch_after.get('current_scheme_id')}"
+            assert batch_after["current_scheme_name"] == expected_scheme_name
+            assert batch_after["config_version"] == expected_cfg_version
+
+            hist_after = svc_post.get_scheme_history(restart_h_bid)
+            assert len(hist_after) == len(hist_before), \
+                f"重启后历史记录数应不变，before={len(hist_before)}, after={len(hist_after)}"
+            assert hist_after[0]["action"] == "rollback"
+
+            r34.ok()
+            print(f"  [PASS] {r34.name}  (hist_count={len(hist_after)}, scheme_id={expected_scheme_id})")
+        except Exception as e:
+            r34.fail(str(e))
+            print(f"  [FAIL] {r34.name}: {e}")
+
+        # ====== 测试 35: 导入导出后的副本继续应用，历史记录正确 ======
+        r35 = TestResult("测试35: 导入导出后的派生方案继续应用到批次，历史记录含来源信息")
+        results.append(r35)
+        try:
+            svc_ie = PipelineService(db_path)
+
+            ie_src_bid = svc_ie.create_batch("ie_src_batch", SAMPLE_CSV)
+            svc_ie.process_batch(ie_src_bid)
+            ie_src_sid = svc_ie.save_scheme("ie_source", batch_id=ie_src_bid, description="导入导出源")
+            ie_derived_sid = svc_ie.derive_scheme(ie_src_sid, "ie_derived", "导入导出派生")
+
+            ie_export_dir = os.path.join(tmpdir, "ie_hist_exports")
+            os.makedirs(ie_export_dir, exist_ok=True)
+            ie_export_path = os.path.join(ie_export_dir, "ie_derived.json")
+            svc_ie.export_scheme_to_file(ie_derived_sid, ie_export_path)
+
+            import_result = svc_ie.import_scheme_from_file(
+                ie_export_path, on_conflict=SchemeImportResult.ACTION_RENAME,
+                new_name="ie_imported_apply")
+            assert import_result.success
+
+            imported_scheme = svc_ie.get_scheme(import_result.scheme_id)
+            assert imported_scheme["source_scheme_id"] == ie_src_sid
+
+            ie_target_bid = svc_ie.create_batch("ie_target_batch", SAMPLE_CSV)
+            svc_ie.process_batch(ie_target_bid)
+
+            new_cfg = svc_ie.apply_scheme_to_batch(import_result.scheme_id, ie_target_bid)
+
+            batch_after = svc_ie.get_batch(ie_target_bid)
+            assert batch_after["current_scheme_id"] == import_result.scheme_id
+            assert batch_after["current_scheme_name"] == "ie_imported_apply"
+
+            history = svc_ie.get_scheme_history(ie_target_bid)
+            assert len(history) >= 1
+            assert history[0]["scheme_id"] == import_result.scheme_id
+            assert history[0]["source_scheme_id"] == ie_src_sid
+
+            r35.ok()
+            print(f"  [PASS] {r35.name}  (imported_id={import_result.scheme_id}, source={ie_src_sid})")
+        except Exception as e:
+            r35.fail(str(e))
+            print(f"  [FAIL] {r35.name}: {e}")
+
+        # ====== 测试 36: CLI history / rollback 命令输出完整 ======
+        r36 = TestResult("测试36: CLI scheme history / rollback 命令输出符合文档，含必要字段")
+        results.append(r36)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+
+            runner = CliRunner()
+            svc_cli2 = PipelineService(db_path)
+
+            cli_h_bid = svc_cli2.create_batch("cli_hist_batch", SAMPLE_CSV)
+            svc_cli2.process_batch(cli_h_bid)
+            cli_h_sid = svc_cli2.save_scheme("cli_hist_scheme", batch_id=cli_h_bid)
+            svc_cli2.apply_scheme_to_batch(cli_h_sid, cli_h_bid)
+            svc_cli2.set_threshold(cli_h_bid, zscore_threshold=1.8)
+
+            res_history = runner.invoke(cli, ["--db", db_path, "scheme", "history", str(cli_h_bid)])
+            assert res_history.exit_code == 0
+            assert "操作" in res_history.output or "apply" in res_history.output
+            assert "方案" in res_history.output
+            assert "配置版本" in res_history.output
+
+            res_rollback = runner.invoke(cli, ["--db", db_path, "scheme", "rollback", str(cli_h_bid)])
+            assert res_rollback.exit_code == 0
+            assert "[OK]" in res_rollback.output
+            assert "配置回滚成功" in res_rollback.output
+            assert "原版本" in res_rollback.output
+            assert "新版本" in res_rollback.output
+            assert "回滚到方案" in res_rollback.output
+            assert "process" in res_rollback.output
+
+            r36.ok()
+            print(f"  [PASS] {r36.name}  (batch={cli_h_bid})")
+        except Exception as e:
+            r36.fail(str(e))
+            print(f"  [FAIL] {r36.name}: {e}")
+
+        # ====== 测试 37: 回滚前后处理结果变化验证 ======
+        r37 = TestResult("测试37: 回滚前后 process 结果有差异（异常数量随阈值变化），回滚可撤销修改")
+        results.append(r37)
+        try:
+            svc_diff = PipelineService(db_path)
+
+            diff_bid = svc_diff.create_batch("diff_rollback_batch", SAMPLE_CSV)
+            svc_diff.process_batch(diff_bid)
+
+            svc_diff.set_threshold(diff_bid, zscore_threshold=2.0)
+            base_run_id, _ = svc_diff.process_batch(diff_bid)
+            base_anomalies = svc_diff.get_run_anomalies(base_run_id)
+            base_count = len(base_anomalies)
+
+            svc_diff.set_threshold(diff_bid, zscore_threshold=0.5)
+            tight_run_id, _ = svc_diff.process_batch(diff_bid)
+            tight_anomalies = svc_diff.get_run_anomalies(tight_run_id)
+            tight_count = len(tight_anomalies)
+            assert tight_count > base_count, \
+                f"收紧阈值后异常应增多，base={base_count}, tight={tight_count}"
+
+            rb_result = svc_diff.rollback_scheme(diff_bid)
+            assert rb_result.success
+
+            rb_run_id, _ = svc_diff.process_batch(diff_bid)
+            rb_anomalies = svc_diff.get_run_anomalies(rb_run_id)
+            rb_count = len(rb_anomalies)
+            assert rb_count == base_count, \
+                f"回滚后异常数应回到基线，base={base_count}, rollback={rb_count}"
+
+            r37.ok()
+            print(f"  [PASS] {r37.name}  (base={base_count}, tight={tight_count}, rollback={rb_count})")
+        except Exception as e:
+            r37.fail(str(e))
+            print(f"  [FAIL] {r37.name}: {e}")
+
+        # ====== 测试 38: 回滚日志输出完整（含来源方案和版本变化） ======
+        r38 = TestResult("测试38: rollback 输出 INFO 日志，含 batch_id、版本变化、方案信息")
+        results.append(r38)
+        try:
+            import logging
+
+            svc_log_rb = PipelineService(db_path)
+
+            log_rb_bid = svc_log_rb.create_batch("log_rollback_batch", SAMPLE_CSV)
+            svc_log_rb.process_batch(log_rb_bid)
+            log_rb_sid = svc_log_rb.save_scheme("log_rb_scheme", batch_id=log_rb_bid)
+            svc_log_rb.apply_scheme_to_batch(log_rb_sid, log_rb_bid)
+            svc_log_rb.set_threshold(log_rb_bid, zscore_threshold=1.5)
+
+            log_records = []
+
+            class _CaptureHandler(logging.Handler):
+                def emit(self, record):
+                    log_records.append(record)
+
+            handler = _CaptureHandler()
+            handler.setLevel(logging.DEBUG)
+            svc_logger = logging.getLogger("pipeline.service")
+            original_level = svc_logger.level
+            svc_logger.addHandler(handler)
+            svc_logger.setLevel(logging.INFO)
+
+            try:
+                before_count = len(log_records)
+                result = svc_log_rb.rollback_scheme(log_rb_bid)
+                assert result.success
+
+                rb_logs = log_records[before_count:]
+                assert len(rb_logs) >= 1, f"rollback 应至少产生 1 条日志，实际 {len(rb_logs)}"
+                assert rb_logs[-1].levelno == logging.INFO
+
+                msg = rb_logs[-1].getMessage()
+                assert "回滚" in msg or "rollback" in msg.lower(), \
+                    f"日志应含回滚标识，实际: {msg}"
+                assert str(log_rb_bid) in msg, \
+                    f"日志应含批次 ID，实际: {msg}"
+                assert "from_version" in msg or "to_version" in msg or "版本" in msg, \
+                    f"日志应含版本变化，实际: {msg}"
+                assert str(log_rb_sid) in msg or "scheme_id" in msg, \
+                    f"日志应含方案信息，实际: {msg}"
+            finally:
+                svc_logger.removeHandler(handler)
+                svc_logger.setLevel(original_level)
+
+            r38.ok()
+            print(f"  [PASS] {r38.name}  (log_count={len(rb_logs)}, level=INFO)")
+        except Exception as e:
+            r38.fail(str(e))
+            print(f"  [FAIL] {r38.name}: {e}")
 
         # ====== 汇总 ======
         print()

@@ -32,6 +32,8 @@ def init_db(db_path: str = None) -> None:
                 locked INTEGER NOT NULL DEFAULT 0,
                 config_version INTEGER NOT NULL DEFAULT 1,
                 config_json TEXT NOT NULL,
+                current_scheme_id INTEGER,
+                current_scheme_name TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 error_message TEXT
@@ -105,6 +107,21 @@ def init_db(db_path: str = None) -> None:
                 FOREIGN KEY (source_scheme_id) REFERENCES analysis_schemes(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS batch_scheme_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                scheme_id INTEGER,
+                scheme_name TEXT,
+                source_scheme_id INTEGER,
+                config_version INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                action TEXT NOT NULL,
+                rolled_back_from_id INTEGER,
+                applied_at TEXT NOT NULL,
+                FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE,
+                FOREIGN KEY (scheme_id) REFERENCES analysis_schemes(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS comparison_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -126,6 +143,7 @@ def init_db(db_path: str = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_anomalies_run_id ON anomalies(run_id);
             CREATE INDEX IF NOT EXISTS idx_exports_batch_id ON exports(batch_id);
             CREATE INDEX IF NOT EXISTS idx_analysis_schemes_name ON analysis_schemes(name);
+            CREATE INDEX IF NOT EXISTS idx_batch_scheme_history_batch_id ON batch_scheme_history(batch_id);
             CREATE INDEX IF NOT EXISTS idx_comparison_reports_scheme_id ON comparison_reports(scheme_id);
         """)
         conn.commit()
@@ -138,6 +156,39 @@ def init_db(db_path: str = None) -> None:
                 "ALTER TABLE analysis_schemes ADD COLUMN source_scheme_id INTEGER "
                 "REFERENCES analysis_schemes(id) ON DELETE SET NULL"
             )
+            conn.commit()
+
+        cursor.execute("PRAGMA table_info(batches)")
+        batch_columns = [col[1] for col in cursor.fetchall()]
+        if "current_scheme_id" not in batch_columns:
+            cursor.execute("ALTER TABLE batches ADD COLUMN current_scheme_id INTEGER")
+            conn.commit()
+        if "current_scheme_name" not in batch_columns:
+            cursor.execute("ALTER TABLE batches ADD COLUMN current_scheme_name TEXT")
+            conn.commit()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS batch_scheme_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                scheme_id INTEGER,
+                scheme_name TEXT,
+                source_scheme_id INTEGER,
+                config_version INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                action TEXT NOT NULL,
+                rolled_back_from_id INTEGER,
+                applied_at TEXT NOT NULL,
+                FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE,
+                FOREIGN KEY (scheme_id) REFERENCES analysis_schemes(id) ON DELETE SET NULL
+            );
+        """)
+        conn.commit()
+
+        cursor.execute("PRAGMA index_list(batch_scheme_history)")
+        has_index = any("idx_batch_scheme_history_batch_id" in row[1] for row in cursor.fetchall())
+        if not has_index:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_batch_scheme_history_batch_id ON batch_scheme_history(batch_id)")
             conn.commit()
     finally:
         conn.close()
@@ -191,14 +242,31 @@ def update_batch_status(conn: sqlite3.Connection, batch_id: int, status: str, er
     conn.commit()
 
 
-def update_batch_config(conn: sqlite3.Connection, batch_id: int, config: Dict[str, Any]) -> None:
-    """更新批次配置"""
+def update_batch_config(conn: sqlite3.Connection, batch_id: int, config: Dict[str, Any],
+                        scheme_id: int = None, scheme_name: str = None) -> None:
+    """更新批次配置，可同时更新当前方案信息"""
     now = datetime.now().isoformat()
     config_json = json.dumps(config, ensure_ascii=False)
     config_version = config.get("version", 1)
+    if scheme_id is not None or scheme_name is not None:
+        conn.execute("""
+            UPDATE batches SET config_version = ?, config_json = ?, current_scheme_id = ?,
+                               current_scheme_name = ?, updated_at = ? WHERE id = ?
+        """, (config_version, config_json, scheme_id, scheme_name, now, batch_id))
+    else:
+        conn.execute("""
+            UPDATE batches SET config_version = ?, config_json = ?, updated_at = ? WHERE id = ?
+        """, (config_version, config_json, now, batch_id))
+    conn.commit()
+
+
+def update_batch_scheme_info(conn: sqlite3.Connection, batch_id: int,
+                             scheme_id: int = None, scheme_name: str = None) -> None:
+    """仅更新批次的当前方案信息，不修改配置"""
+    now = datetime.now().isoformat()
     conn.execute("""
-        UPDATE batches SET config_version = ?, config_json = ?, updated_at = ? WHERE id = ?
-    """, (config_version, config_json, now, batch_id))
+        UPDATE batches SET current_scheme_id = ?, current_scheme_name = ?, updated_at = ? WHERE id = ?
+    """, (scheme_id, scheme_name, now, batch_id))
     conn.commit()
 
 
@@ -514,3 +582,93 @@ def delete_comparison_report(conn: sqlite3.Connection, report_id: int) -> None:
     """删除对比报告"""
     conn.execute("DELETE FROM comparison_reports WHERE id = ?", (report_id,))
     conn.commit()
+
+
+# ============ Batch Scheme History Operations ============
+
+SCHEME_HISTORY_ACTION_APPLY = "apply"
+SCHEME_HISTORY_ACTION_ROLLBACK = "rollback"
+SCHEME_HISTORY_ACTION_DIRECT = "direct"
+
+
+def add_scheme_history(conn: sqlite3.Connection, batch_id: int, config: Dict[str, Any],
+                       action: str, scheme_id: int = None, scheme_name: str = None,
+                       source_scheme_id: int = None, rolled_back_from_id: int = None) -> int:
+    """添加批次方案历史记录，返回历史记录 ID"""
+    now = datetime.now().isoformat()
+    config_json = json.dumps(config, ensure_ascii=False)
+    config_version = config.get("version", 1)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO batch_scheme_history (
+            batch_id, scheme_id, scheme_name, source_scheme_id,
+            config_version, config_json, action, rolled_back_from_id, applied_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (batch_id, scheme_id, scheme_name, source_scheme_id,
+          config_version, config_json, action, rolled_back_from_id, now))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_scheme_history(conn: sqlite3.Connection, batch_id: int) -> List[Dict[str, Any]]:
+    """获取批次的方案应用历史，按时间倒序排列"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM batch_scheme_history
+        WHERE batch_id = ? ORDER BY id DESC
+    """, (batch_id,))
+    results = []
+    for row in cursor.fetchall():
+        r = dict(row)
+        r["config"] = json.loads(r["config_json"])
+        del r["config_json"]
+        results.append(r)
+    return results
+
+
+def get_latest_scheme_history(conn: sqlite3.Connection, batch_id: int) -> Optional[Dict[str, Any]]:
+    """获取批次最新的方案历史记录"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM batch_scheme_history
+        WHERE batch_id = ? ORDER BY id DESC LIMIT 1
+    """, (batch_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    r = dict(row)
+    r["config"] = json.loads(r["config_json"])
+    del r["config_json"]
+    return r
+
+
+def get_previous_scheme_history(conn: sqlite3.Connection, batch_id: int,
+                                current_history_id: int) -> Optional[Dict[str, Any]]:
+    """获取批次当前历史记录的上一条（用于回滚）"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM batch_scheme_history
+        WHERE batch_id = ? AND id < ? ORDER BY id DESC LIMIT 1
+    """, (batch_id, current_history_id))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    r = dict(row)
+    r["config"] = json.loads(r["config_json"])
+    del r["config_json"]
+    return r
+
+
+def get_scheme_history_by_id(conn: sqlite3.Connection, history_id: int) -> Optional[Dict[str, Any]]:
+    """按 ID 获取方案历史记录"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM batch_scheme_history WHERE id = ?
+    """, (history_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    r = dict(row)
+    r["config"] = json.loads(r["config_json"])
+    del r["config_json"]
+    return r
