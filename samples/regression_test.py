@@ -2536,6 +2536,129 @@ def run_tests():
             r50.fail(str(e))
             print(f"  [FAIL] {r50.name}: {e}")
 
+        # ====== 测试 51: 锁定批次 dry-run 编码容错（UnicodeEncodeError 根因复现） ======
+        r51 = TestResult("测试51: 锁定批次 dry-run 编码容错（GBK 下不抛 UnicodeEncodeError）")
+        results.append(r51)
+        try:
+            from click.testing import CliRunner
+            from pipeline import cli as cli_mod
+
+            svc_cli6 = PipelineService(db_path)
+            cli6_bid = svc_cli6.create_batch("cli6_enc_lock", SAMPLE_CSV)
+            svc_cli6.process_batch(cli6_bid)
+            cli6_sid = svc_cli6.save_scheme("cli6_enc_scheme", batch_id=cli6_bid)
+            svc_cli6.apply_scheme_to_batch(cli6_sid, cli6_bid)
+            svc_cli6.lock_batch(cli6_bid)
+
+            runner6 = CliRunner()
+
+            # 场景 1: 正常调用 CliRunner（UTF-8），验证锁定拦截
+            dr_normal = runner6.invoke(cli, ["--db", db_path, "scheme", "dry-run",
+                                             str(cli6_sid), str(cli6_bid)])
+            assert dr_normal.exit_code != 0, "锁定时 dry-run 应 exit!=0"
+            assert "[ERROR]" in dr_normal.output, "锁定 dry-run 输出应含 [ERROR]"
+            assert "锁定" in dr_normal.output, "锁定 dry-run 输出应含锁定信息"
+            assert "风险详情" in dr_normal.output, "锁定 dry-run 输出应含风险详情"
+            assert "批次已锁定" in dr_normal.output, "锁定 dry-run 输出应含批次已锁定"
+
+            # 场景 2: 模拟 GBK 编码环境，注入 ⚠ 字符触发 UnicodeEncodeError，验证容错
+            saved_stdout_encoding = None
+            saved_stderr_encoding = None
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+            try:
+                import io
+                fake_gbk_stdout = io.TextIOWrapper(
+                    io.BytesIO(), encoding="gbk", errors="strict", write_through=True
+                )
+                fake_gbk_stderr = io.TextIOWrapper(
+                    io.BytesIO(), encoding="gbk", errors="strict", write_through=True
+                )
+
+                sys.stdout = fake_gbk_stdout
+                sys.stderr = fake_gbk_stderr
+
+                try:
+                    fake_gbk_stdout.write("\u26a0 测试危险字符")
+                    fake_gbk_stdout.flush()
+                    raise RuntimeError("未触发 UnicodeEncodeError，GBK mock 失败")
+                except UnicodeEncodeError:
+                    pass
+
+                cli_mod._configure_terminal_encoding()
+
+                try:
+                    fake_gbk_stdout.write("\u26a0 测试危险字符")
+                    fake_gbk_stdout.flush()
+                    encode_ok = True
+                except UnicodeEncodeError:
+                    encode_ok = False
+                assert encode_ok, "_configure_terminal_encoding 后 Unicode 字符不应抛异常"
+
+            finally:
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
+
+            # 场景 3: 锁定批次 dry-run 在编码容错环境下完整输出
+            dr_encoded = runner6.invoke(cli, ["--db", db_path, "scheme", "dry-run",
+                                              str(cli6_sid), str(cli6_bid)])
+            assert dr_encoded.exit_code != 0
+            assert "[ERROR]" in dr_encoded.output
+            assert "批次已锁定" in dr_encoded.output or "[!]" in dr_encoded.output
+            assert "风险数量" in dr_encoded.output or "风险详情" in dr_encoded.output
+
+            svc_cli6.unlock_batch(cli6_bid)
+
+            r51.ok()
+            print(f"  [PASS] {r51.name}  (编码容错生效，Unicode 字符不崩)")
+        except Exception as e:
+            r51.fail(str(e))
+            print(f"  [FAIL] {r51.name}: {e}")
+
+        # ====== 测试 52: 锁定批次 dry-run 完整行为 + 正常链路未受影响 ======
+        r52 = TestResult("测试52: 锁定 dry-run 拦截完整行为 + 正常链路未退化")
+        results.append(r52)
+        try:
+            from click.testing import CliRunner
+            runner7 = CliRunner()
+
+            svc_cli7 = PipelineService(db_path)
+
+            # Part A: 正常链路 dry-run（不锁定）- 验证正常通过
+            cli7_ok_bid = svc_cli7.create_batch("cli7_ok", SAMPLE_CSV)
+            svc_cli7.process_batch(cli7_ok_bid)
+            cli7_ok_sid = svc_cli7.save_scheme("cli7_ok_scheme", batch_id=cli7_ok_bid)
+
+            dr_ok = runner7.invoke(cli, ["--db", db_path, "scheme", "dry-run",
+                                         str(cli7_ok_sid), str(cli7_ok_bid)])
+            assert dr_ok.exit_code == 0, f"正常 dry-run 应 exit=0，实际={dr_ok.exit_code}: {dr_ok.output}"
+            assert "[OK]" in dr_ok.output or "检查通过" in dr_ok.output or "预检通过" in dr_ok.output
+            assert "目标批次" in dr_ok.output
+            assert "待应用方案" in dr_ok.output
+            assert "配置变更预览" in dr_ok.output or "风险数量: 0" in dr_ok.output
+            assert "UnicodeEncodeError" not in dr_ok.output
+
+            # Part B: 锁定后 dry-run - 验证被拦截、退出码正确、信息完整
+            svc_cli7.lock_batch(cli7_ok_bid)
+            dr_blocked = runner7.invoke(cli, ["--db", db_path, "scheme", "dry-run",
+                                               str(cli7_ok_sid), str(cli7_ok_bid)])
+            assert dr_blocked.exit_code != 0, f"锁定 dry-run 应 exit!=0，实际={dr_blocked.exit_code}"
+            assert "[ERROR]" in dr_blocked.output, "锁定 dry-run 应输出 [ERROR]"
+            assert "检查未通过" in dr_blocked.output or "预检未通过" in dr_blocked.output
+            assert "锁定" in dr_blocked.output, "锁定 dry-run 应说明锁定原因"
+            assert "风险详情" in dr_blocked.output, "锁定 dry-run 应展示风险详情"
+            assert "风险数量: 1" in dr_blocked.output, "锁定 dry-run 应有 1 条风险"
+            assert "[!]" in dr_blocked.output or "批次已锁定" in dr_blocked.output
+            assert "UnicodeEncodeError" not in dr_blocked.output
+
+            svc_cli7.unlock_batch(cli7_ok_bid)
+
+            r52.ok()
+            print(f"  [PASS] {r52.name}  (正常链路未退化，锁定拦截完整)")
+        except Exception as e:
+            r52.fail(str(e))
+            print(f"  [FAIL] {r52.name}: {e}")
+
         # ====== 汇总 ======
         print()
         total = len(results)

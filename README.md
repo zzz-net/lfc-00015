@@ -246,4 +246,8 @@ python samples/regression_test.py
 - **执行失败后历史可查**：失败/阻止场景审计日志包含错误原因，可通过 result=failed/blocked 筛选
 - **导入导出后历史连续**：方案导出再导入后，通过 original_id 保持关联，继续应用时历史不中断
 - **跨重启审计持久化**：重启后审计日志完整保留，可正常查询
-- **CLI 输出对齐**：dry-run 和 audit-history 命令输出与 README 文档一致
+- **CLI 输出对齐**：dry-run、audit-history、switch 命令输出与 README 文档一致
+- **回滚审计记录完整**：成功/失败/阻止三种回滚场景均有审计日志，含前后配置差异
+- **switch 命令流水完整**：apply/clone/derive/rollback 四种模式均走预检→确认→执行
+- **回滚前后结果变化**：配置版本、当前方案、配置值在回滚后正确回到上一版本
+- **rollback dry-run 拦截生效**：锁定批次、无历史、最早版本三种场景预检阻止

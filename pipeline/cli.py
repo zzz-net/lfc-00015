@@ -14,6 +14,20 @@ from .config import get_default_config, load_config
 
 OK = "[OK]"
 ERR = "[ERROR]"
+WARN = "[!]"
+
+
+def _configure_terminal_encoding():
+    """配置终端编码容错，避免 Windows PowerShell GBK 下 UnicodeEncodeError。
+
+    根因处理：将 stdout/stderr 用 errors='replace' 包装，遇到不可编码字符时
+    用替代符而非抛出异常崩溃。同时对可预期的特殊字符使用 ASCII 友好形式。
+    """
+    if sys.platform == "win32":
+        if sys.stdout.encoding and "utf" not in sys.stdout.encoding.lower():
+            sys.stdout.reconfigure(errors="replace")
+        if sys.stderr.encoding and "utf" not in sys.stderr.encoding.lower():
+            sys.stderr.reconfigure(errors="replace")
 
 
 def _get_service(db_path: str = None) -> PipelineService:
@@ -36,7 +50,7 @@ def _print_switch_result(sw: SwitchSchemeResult, label: str, is_dry_run: bool):
         if dr.batch_id:
             click.echo(f"  目标批次:   #{dr.batch_id}" + (f" '{dr.batch_name}'" if dr.batch_name else ""))
             if dr.batch_locked:
-                click.echo(f"             ⚠ 批次已锁定")
+                click.echo(f"             {WARN} 批次已锁定")
         if dr.current_scheme_id:
             click.echo(f"  当前方案:   #{dr.current_scheme_id}" +
                        (f" '{dr.current_scheme_name}'" if dr.current_scheme_name else "") +
@@ -132,7 +146,7 @@ def _print_dry_run_enhanced(result: DryRunResult):
         click.echo(f"  目标批次:   #{result.batch_id}" +
                    (f" '{result.batch_name}'" if result.batch_name else ""))
         if result.batch_locked:
-            click.echo(f"             ⚠ 批次已锁定")
+            click.echo(f"             {WARN} 批次已锁定")
     if result.current_scheme_id:
         click.echo(f"  当前方案:   #{result.current_scheme_id}" +
                    (f" '{result.current_scheme_name}'" if result.current_scheme_name else "") +
@@ -195,6 +209,7 @@ def _print_dry_run_enhanced(result: DryRunResult):
 @click.pass_context
 def cli(ctx, db_path):
     """实验数据处理流水线 CLI"""
+    _configure_terminal_encoding()
     ctx.ensure_object(dict)
     ctx.obj["db_path"] = db_path
 
