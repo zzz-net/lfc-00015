@@ -2363,7 +2363,7 @@ def ticket_export(ctx, ticket_id, output):
 @click.option("--new-title", default=None, help="重命名时使用的新标题")
 @click.pass_context
 def ticket_import(ctx, file_path, on_conflict, new_title):
-    """从 JSON 文件导入工单（含处理历史）。遇到同标题冲突时支持 reject 和 rename。"""
+    """从 JSON 文件导入工单（含处理历史）。冲突检测范围：同标题 或 同来源(批次+运行)。"""
     svc = _get_service(ctx.obj.get("db_path"))
     try:
         result = svc.import_ticket(file_path, on_conflict=on_conflict,
@@ -2379,16 +2379,32 @@ def ticket_import(ctx, file_path, on_conflict, new_title):
                 click.echo(f"  落地标题:   {result.final_title}")
             else:
                 click.echo(f"  标题:       '{result.final_title}'")
+            if result.conflict_type:
+                ct_label = {
+                    "title_exists": "标题冲突",
+                    "source_exists": "来源冲突"
+                }.get(result.conflict_type, result.conflict_type)
+                click.echo(f"  冲突类型:   {ct_label}")
             if result.original_ticket_id:
                 click.echo(f"  原始工单ID: #{result.original_ticket_id}")
             if result.imported_from:
                 click.echo(f"  导入来源:   {result.imported_from}")
         else:
-            click.echo(f"  已拒绝: {result.message}")
+            click.echo(f"{WARN} 已拒绝: {result.message}")
+            if result.conflict_type:
+                ct_label = {
+                    "title_exists": "标题冲突",
+                    "source_exists": "来源冲突"
+                }.get(result.conflict_type, result.conflict_type)
+                click.echo(f"  冲突类型:   {ct_label}")
             if result.original_title:
                 click.echo(f"  原始标题:   {result.original_title}")
     except TicketConflictError as e:
-        click.echo(f"{ERR} 导入冲突 ({e.conflict_type}): {e}", err=True)
+        ct_label = {
+            "title_exists": "标题冲突",
+            "source_exists": "来源冲突"
+        }.get(e.conflict_type, e.conflict_type)
+        click.echo(f"{ERR} 导入冲突 ({ct_label}): {e}", err=True)
         click.echo(f"  详情: {e.details}", err=True)
         click.echo("  提示: 使用 --on-conflict reject/rename 自动处理", err=True)
         sys.exit(1)

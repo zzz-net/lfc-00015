@@ -247,7 +247,7 @@ class TicketImportResult:
     def __init__(self, success: bool, ticket_id: int = None, action: str = None,
                  message: str = None, original_title: str = None,
                  final_title: str = None, original_ticket_id: int = None,
-                 imported_from: str = None):
+                 imported_from: str = None, conflict_type: str = None):
         self.success = success
         self.ticket_id = ticket_id
         self.action = action
@@ -256,6 +256,7 @@ class TicketImportResult:
         self.final_title = final_title
         self.original_ticket_id = original_ticket_id
         self.imported_from = imported_from
+        self.conflict_type = conflict_type
 
 
 class PipelineService:
@@ -2608,34 +2609,146 @@ class PipelineService:
 
     # ========== 复核工单 ==========
 
+    def _create_ticket_full(self, conn: sqlite3.Connection, title: str,
+                           source_batch_id: int = None, source_run_id: int = None,
+                           trigger_rule: str = None, assignee: str = None,
+                           status: str = None, resolution: str = None,
+                           notes: List[Dict[str, Any]] = None,
+                           original_ticket_id: int = None,
+                           imported_from: str = None) -> int:
+        """
+        统一工单创建入口：创建工单+设置状态+添加备注+审计日志，一条龙。
+        供 create_ticket 和 import_ticket 共用，消除重复逻辑。
+        """
+        tid = db.create_ticket(
+            conn, title, source_batch_id, source_run_id,
+            trigger_rule, assignee,
+            original_ticket_id=original_ticket_id,
+            imported_from=imported_from
+        )
+
+        if status is not None:
+            db.update_ticket_status(conn, tid, status, assignee=assignee, resolution=resolution)
+
+        if assignee:
+            db.add_ticket_note(conn, tid, f"工单创建并分配给 {assignee}",
+                               note_type=db.TICKET_NOTE_ASSIGN)
+        else:
+            db.add_ticket_note(conn, tid, "工单已创建", note_type=db.TICKET_NOTE_STATUS_CHANGE)
+
+        if notes:
+            for n in notes:
+                db.add_ticket_note(
+                    conn, tid, n["content"],
+                    author=n.get("author"),
+                    note_type=n.get("note_type", db.TICKET_NOTE_COMMENT)
+                )
+
+        db.add_ticket_audit_log(
+            conn, action=db.AUDIT_ACTION_TICKET_CREATE,
+            ticket_id=tid, ticket_title=title,
+            source_batch_id=source_batch_id, source_run_id=source_run_id,
+            assignee=assignee,
+            result=db.AUDIT_RESULT_SUCCESS,
+            trigger_method=db.AUDIT_TRIGGER_IMPORT if imported_from else db.AUDIT_TRIGGER_CLI
+        )
+
+        logger.info(f"复核工单已创建: id={tid}, title='{title}', "
+                    f"source_batch_id={source_batch_id}, trigger_rule='{trigger_rule}'")
+        return tid
+
+    def _resolve_ticket_conflict(self, conn: sqlite3.Connection,
+                                conflict_type: str,
+                                existing: Dict[str, Any],
+                                title: str,
+                                on_conflict: str,
+                                new_title: str = None,
+                                original_ticket_id: int = None,
+                                imported_from: str = None) -> Optional[TicketImportResult]:
+        """
+        统一冲突处理入口：同标题 或 同来源 都走这一套决策逻辑。
+        支持 reject / rename 两种决策，结果落到 TicketImportResult 和审计日志。
+        """
+        conflict_type_map = {
+            "title_exists": TicketConflictError.CONFLICT_TITLE,
+            "source_exists": TicketConflictError.CONFLICT_SOURCE
+        }
+        ct = conflict_type_map.get(conflict_type, conflict_type)
+
+        conflict_label = {
+            TicketConflictError.CONFLICT_TITLE: f"工单标题已存在: '{title}'",
+            TicketConflictError.CONFLICT_SOURCE: f"工单来源已存在: batch={existing.get('source_batch_id')}, run={existing.get('source_run_id')}"
+        }[ct]
+
+        if on_conflict == TicketImportResult.ACTION_REJECT or on_conflict is None:
+            db.add_ticket_audit_log(
+                conn, action=db.AUDIT_ACTION_TICKET_IMPORT,
+                ticket_title=title,
+                source_batch_id=existing.get("source_batch_id"),
+                source_run_id=existing.get("source_run_id"),
+                conflict_type=ct,
+                conflict_action=TicketImportResult.ACTION_REJECT,
+                original_title=title,
+                original_ticket_id=original_ticket_id,
+                imported_from=imported_from,
+                result=db.AUDIT_RESULT_BLOCKED,
+                trigger_method=db.AUDIT_TRIGGER_IMPORT,
+                error_message=f"{conflict_label}，拒绝导入"
+            )
+            logger.info(f"工单导入(拒绝): {conflict_label}, existing_id={existing['id']}")
+            return TicketImportResult(
+                False, action=TicketImportResult.ACTION_REJECT,
+                message=f"{conflict_label}，拒绝导入",
+                original_title=title,
+                original_ticket_id=original_ticket_id,
+                imported_from=imported_from,
+                conflict_type=ct
+            )
+
+        elif on_conflict == TicketImportResult.ACTION_RENAME:
+            final_title = new_title or f"{title}_imported"
+            counter = 1
+            while db.get_ticket_by_title(conn, final_title):
+                final_title = f"{title}_imported_{counter}"
+                counter += 1
+
+            logger.info(f"工单导入(重命名): title='{title}' -> '{final_title}', conflict={ct}")
+            return TicketImportResult(
+                True, action=TicketImportResult.ACTION_RENAME,
+                message=f"已重命名导入({ct}): '{title}' -> '{final_title}'",
+                original_title=title, final_title=final_title,
+                original_ticket_id=original_ticket_id,
+                imported_from=imported_from,
+                conflict_type=ct
+            )
+
+        else:
+            raise TicketError(f"未知冲突处理策略: {on_conflict}")
+
     def create_ticket(self, title: str, source_batch_id: int = None,
                       source_run_id: int = None, trigger_rule: str = None,
                       assignee: str = None) -> int:
         conn = self._conn()
         try:
-            existing = db.get_ticket_by_title(conn, title)
-            if existing:
-                raise TicketConflictError(
-                    TicketConflictError.CONFLICT_TITLE,
-                    f"工单标题已存在: '{title}'",
-                    {"existing_ticket_id": existing["id"]}
-                )
-            tid = db.create_ticket(conn, title, source_batch_id, source_run_id,
-                                   trigger_rule, assignee)
-            if assignee:
-                db.add_ticket_note(conn, tid, f"工单创建并分配给 {assignee}",
-                                   note_type=db.TICKET_NOTE_ASSIGN)
-            else:
-                db.add_ticket_note(conn, tid, "工单已创建", note_type=db.TICKET_NOTE_STATUS_CHANGE)
-            db.add_scheme_audit_log(
-                conn, batch_id=source_batch_id,
-                action=db.AUDIT_ACTION_TICKET_CREATE,
-                trigger_method=db.AUDIT_TRIGGER_CLI,
-                result=db.AUDIT_RESULT_SUCCESS,
-                error_message=None
+            conflict_type, existing = db.check_ticket_conflict(
+                conn, title, source_batch_id, source_run_id
             )
-            logger.info(f"复核工单已创建: id={tid}, title='{title}', "
-                        f"source_batch_id={source_batch_id}, trigger_rule='{trigger_rule}'")
+            if existing:
+                conflict_type_map = {
+                    "title_exists": TicketConflictError.CONFLICT_TITLE,
+                    "source_exists": TicketConflictError.CONFLICT_SOURCE
+                }
+                ct = conflict_type_map.get(conflict_type, conflict_type)
+                raise TicketConflictError(
+                    ct,
+                    f"工单冲突({ct}): '{title}'",
+                    {"existing_ticket_id": existing["id"], "conflict_type": ct}
+                )
+
+            tid = self._create_ticket_full(
+                conn, title, source_batch_id, source_run_id,
+                trigger_rule, assignee
+            )
             return tid
         finally:
             conn.close()
@@ -2669,12 +2782,13 @@ class PipelineService:
             db.add_ticket_note(conn, ticket_id,
                                f"分配: {old_assignee or '(无)'} → {assignee}",
                                note_type=db.TICKET_NOTE_ASSIGN)
-            db.add_scheme_audit_log(
-                conn, batch_id=ticket.get("source_batch_id"),
-                action=db.AUDIT_ACTION_TICKET_ASSIGN,
-                trigger_method=db.AUDIT_TRIGGER_CLI,
-                result=db.AUDIT_RESULT_SUCCESS,
-                error_message=None
+            db.add_ticket_audit_log(
+                conn, action=db.AUDIT_ACTION_TICKET_ASSIGN,
+                ticket_id=ticket_id, ticket_title=ticket["title"],
+                source_batch_id=ticket.get("source_batch_id"),
+                source_run_id=ticket.get("source_run_id"),
+                assignee=assignee,
+                result=db.AUDIT_RESULT_SUCCESS
             )
             logger.info(f"工单已分配: id={ticket_id}, assignee='{assignee}'")
         finally:
@@ -2695,12 +2809,13 @@ class PipelineService:
                                f"已关闭，结论: {resolution}",
                                author=effective_assignee,
                                note_type=db.TICKET_NOTE_RESOLVE)
-            db.add_scheme_audit_log(
-                conn, batch_id=ticket.get("source_batch_id"),
-                action=db.AUDIT_ACTION_TICKET_RESOLVE,
-                trigger_method=db.AUDIT_TRIGGER_CLI,
-                result=db.AUDIT_RESULT_SUCCESS,
-                error_message=None
+            db.add_ticket_audit_log(
+                conn, action=db.AUDIT_ACTION_TICKET_RESOLVE,
+                ticket_id=ticket_id, ticket_title=ticket["title"],
+                source_batch_id=ticket.get("source_batch_id"),
+                source_run_id=ticket.get("source_run_id"),
+                assignee=effective_assignee,
+                result=db.AUDIT_RESULT_SUCCESS
             )
             logger.info(f"工单已关闭: id={ticket_id}, resolution='{resolution}'")
         finally:
@@ -2718,12 +2833,13 @@ class PipelineService:
             db.add_ticket_note(conn, ticket_id,
                                f"重新打开，原因: {reason}",
                                note_type=db.TICKET_NOTE_REOPEN)
-            db.add_scheme_audit_log(
-                conn, batch_id=ticket.get("source_batch_id"),
-                action=db.AUDIT_ACTION_TICKET_REOPEN,
-                trigger_method=db.AUDIT_TRIGGER_CLI,
-                result=db.AUDIT_RESULT_SUCCESS,
-                error_message=None
+            db.add_ticket_audit_log(
+                conn, action=db.AUDIT_ACTION_TICKET_REOPEN,
+                ticket_id=ticket_id, ticket_title=ticket["title"],
+                source_batch_id=ticket.get("source_batch_id"),
+                source_run_id=ticket.get("source_run_id"),
+                assignee=ticket.get("assignee"),
+                result=db.AUDIT_RESULT_SUCCESS
             )
             logger.info(f"工单已重新打开: id={ticket_id}, reason='{reason}'")
         finally:
@@ -2764,7 +2880,7 @@ class PipelineService:
                 "status": ticket["status"],
                 "assignee": ticket.get("assignee"),
                 "resolution": ticket.get("resolution"),
-                "original_ticket_id": ticket_id,
+                "original_ticket_id": ticket.get("original_ticket_id") or ticket_id,
                 "notes": [
                     {
                         "author": n.get("author"),
@@ -2781,12 +2897,13 @@ class PipelineService:
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
             with open(output_path, "w", encoding="utf-8") as f:
                 json.dump(export_data, f, indent=2, ensure_ascii=False)
-            db.add_scheme_audit_log(
-                conn, batch_id=ticket.get("source_batch_id"),
-                action=db.AUDIT_ACTION_TICKET_EXPORT,
-                trigger_method=db.AUDIT_TRIGGER_CLI,
-                result=db.AUDIT_RESULT_SUCCESS,
-                error_message=None
+            db.add_ticket_audit_log(
+                conn, action=db.AUDIT_ACTION_TICKET_EXPORT,
+                ticket_id=ticket_id, ticket_title=ticket["title"],
+                source_batch_id=ticket.get("source_batch_id"),
+                source_run_id=ticket.get("source_run_id"),
+                assignee=ticket.get("assignee"),
+                result=db.AUDIT_RESULT_SUCCESS
             )
             logger.info(f"工单已导出: id={ticket_id}, path='{output_path}'")
             return os.path.abspath(output_path)
@@ -2807,95 +2924,82 @@ class PipelineService:
         exported_at = data.get("exported_at")
         imported_from = f"{file_path}@{exported_at}" if exported_at else file_path
 
+        source_batch_id = data.get("source_batch_id")
+        source_run_id = data.get("source_run_id")
+        status = data.get("status")
+        resolution = data.get("resolution")
+        assignee = data.get("assignee")
+        trigger_rule = data.get("trigger_rule")
+        notes = data.get("notes", [])
+
         conn = self._conn()
         try:
-            existing = db.get_ticket_by_title(conn, title)
+            conflict_type, existing = db.check_ticket_conflict(
+                conn, title, source_batch_id, source_run_id
+            )
             if existing:
-                if on_conflict == TicketImportResult.ACTION_REJECT or on_conflict is None:
-                    db.add_scheme_audit_log(
-                        conn, action=db.AUDIT_ACTION_TICKET_IMPORT,
-                        trigger_method=db.AUDIT_TRIGGER_IMPORT,
-                        result=db.AUDIT_RESULT_BLOCKED,
-                        error_message=f"工单标题冲突，拒绝导入: '{title}'"
-                    )
-                    logger.info(f"工单导入(拒绝): title='{title}', existing_id={existing['id']}")
-                    return TicketImportResult(
-                        False, action=TicketImportResult.ACTION_REJECT,
-                        message=f"工单标题已存在: '{title}'，拒绝导入",
-                        original_title=title, original_ticket_id=original_ticket_id,
-                        imported_from=imported_from
-                    )
-                elif on_conflict == TicketImportResult.ACTION_RENAME:
-                    final_title = new_title or f"{title}_imported"
-                    counter = 1
-                    while db.get_ticket_by_title(conn, final_title):
-                        final_title = f"{title}_imported_{counter}"
-                        counter += 1
-                    tid = db.create_ticket(
-                        conn, final_title,
-                        source_batch_id=data.get("source_batch_id"),
-                        source_run_id=data.get("source_run_id"),
-                        trigger_rule=data.get("trigger_rule"),
-                        assignee=data.get("assignee"),
-                        original_ticket_id=original_ticket_id,
-                        imported_from=imported_from
-                    )
-                    if data.get("resolution"):
-                        db.update_ticket_status(conn, tid, data["status"],
-                                                assignee=data.get("assignee"),
-                                                resolution=data.get("resolution"))
-                    for note in data.get("notes", []):
-                        db.add_ticket_note(conn, tid, note["content"],
-                                           author=note.get("author"),
-                                           note_type=note.get("note_type", db.TICKET_NOTE_COMMENT))
-                    db.add_scheme_audit_log(
-                        conn, action=db.AUDIT_ACTION_TICKET_IMPORT,
-                        trigger_method=db.AUDIT_TRIGGER_IMPORT,
-                        result=db.AUDIT_RESULT_SUCCESS,
-                        error_message=None
-                    )
-                    logger.info(f"工单导入(重命名): title='{title}' -> '{final_title}', id={tid}")
-                    return TicketImportResult(
-                        True, ticket_id=tid, action=TicketImportResult.ACTION_RENAME,
-                        message=f"已重命名导入: '{title}' -> '{final_title}'",
-                        original_title=title, final_title=final_title,
-                        original_ticket_id=original_ticket_id,
-                        imported_from=imported_from
-                    )
-                else:
-                    raise TicketError(f"未知冲突处理策略: {on_conflict}")
-            else:
-                tid = db.create_ticket(
-                    conn, title,
-                    source_batch_id=data.get("source_batch_id"),
-                    source_run_id=data.get("source_run_id"),
-                    trigger_rule=data.get("trigger_rule"),
-                    assignee=data.get("assignee"),
-                    original_ticket_id=original_ticket_id,
-                    imported_from=imported_from
+                result = self._resolve_ticket_conflict(
+                    conn, conflict_type, existing, title,
+                    on_conflict, new_title,
+                    original_ticket_id, imported_from
                 )
-                if data.get("resolution"):
-                    db.update_ticket_status(conn, tid, data["status"],
-                                            assignee=data.get("assignee"),
-                                            resolution=data.get("resolution"))
-                for note in data.get("notes", []):
-                    db.add_ticket_note(conn, tid, note["content"],
-                                       author=note.get("author"),
-                                       note_type=note.get("note_type", db.TICKET_NOTE_COMMENT))
-                db.add_scheme_audit_log(
-                    conn, action=db.AUDIT_ACTION_TICKET_IMPORT,
-                    trigger_method=db.AUDIT_TRIGGER_IMPORT,
-                    result=db.AUDIT_RESULT_SUCCESS,
-                    error_message=None
-                )
-                logger.info(f"工单已导入: title='{title}', id={tid}")
-                return TicketImportResult(
-                    True, ticket_id=tid,
-                    message=f"已导入工单: '{title}'",
-                    original_title=title, final_title=title,
-                    original_ticket_id=original_ticket_id,
-                    imported_from=imported_from
-                )
+                if result is not None:
+                    if result.success and result.action == TicketImportResult.ACTION_RENAME:
+                        tid = self._create_ticket_full(
+                            conn, result.final_title,
+                            source_batch_id, source_run_id,
+                            trigger_rule, assignee,
+                            status, resolution, notes,
+                            original_ticket_id, imported_from
+                        )
+                        result.ticket_id = tid
+                        db.add_ticket_audit_log(
+                            conn, action=db.AUDIT_ACTION_TICKET_IMPORT,
+                            ticket_id=tid, ticket_title=result.final_title,
+                            source_batch_id=source_batch_id,
+                            source_run_id=source_run_id,
+                            assignee=assignee,
+                            conflict_type=result.conflict_type,
+                            conflict_action=TicketImportResult.ACTION_RENAME,
+                            original_title=title,
+                            final_title=result.final_title,
+                            original_ticket_id=original_ticket_id,
+                            imported_from=imported_from,
+                            result=db.AUDIT_RESULT_SUCCESS,
+                            trigger_method=db.AUDIT_TRIGGER_IMPORT
+                        )
+                    return result
+
+            tid = self._create_ticket_full(
+                conn, title,
+                source_batch_id, source_run_id,
+                trigger_rule, assignee,
+                status, resolution, notes,
+                original_ticket_id, imported_from
+            )
+
+            db.add_ticket_audit_log(
+                conn, action=db.AUDIT_ACTION_TICKET_IMPORT,
+                ticket_id=tid, ticket_title=title,
+                source_batch_id=source_batch_id,
+                source_run_id=source_run_id,
+                assignee=assignee,
+                original_title=title,
+                final_title=title,
+                original_ticket_id=original_ticket_id,
+                imported_from=imported_from,
+                result=db.AUDIT_RESULT_SUCCESS,
+                trigger_method=db.AUDIT_TRIGGER_IMPORT
+            )
+
+            logger.info(f"工单已导入: title='{title}', id={tid}")
+            return TicketImportResult(
+                True, ticket_id=tid,
+                message=f"已导入工单: '{title}'",
+                original_title=title, final_title=title,
+                original_ticket_id=original_ticket_id,
+                imported_from=imported_from
+            )
         finally:
             conn.close()
 

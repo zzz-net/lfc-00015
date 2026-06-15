@@ -1603,6 +1603,46 @@ def get_ticket_by_title(conn: sqlite3.Connection, title: str) -> Optional[Dict[s
     return dict(row) if row else None
 
 
+def get_ticket_by_source(conn: sqlite3.Connection, source_batch_id: int = None,
+                         source_run_id: int = None) -> Optional[Dict[str, Any]]:
+    """按来源批次和运行ID查找工单，用于同来源冲突检测"""
+    if source_batch_id is None and source_run_id is None:
+        return None
+    cursor = conn.cursor()
+    conditions = []
+    params = []
+    if source_batch_id is not None:
+        conditions.append("source_batch_id = ?")
+        params.append(source_batch_id)
+    if source_run_id is not None:
+        conditions.append("source_run_id = ?")
+        params.append(source_run_id)
+    query = f"SELECT * FROM review_tickets WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT 1"
+    cursor.execute(query, params)
+    row = cursor.fetchone()
+    return dict(row) if row else None
+
+
+def check_ticket_conflict(conn: sqlite3.Connection, title: str,
+                        source_batch_id: int = None,
+                        source_run_id: int = None) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """
+    统一工单冲突检测：同标题 或 同来源(批次+运行)。
+    返回 (冲突类型, 已存在工单信息)，无冲突返回 (None, None)。
+    优先级：标题冲突 > 来源冲突。
+    """
+    existing_title = get_ticket_by_title(conn, title)
+    if existing_title:
+        return "title_exists", existing_title
+
+    if source_batch_id is not None or source_run_id is not None:
+        existing_source = get_ticket_by_source(conn, source_batch_id, source_run_id)
+        if existing_source:
+            return "source_exists", existing_source
+
+    return None, None
+
+
 def list_tickets(conn: sqlite3.Connection, status: str = None,
                  assignee: str = None,
                  source_batch_id: int = None,
@@ -1716,3 +1756,57 @@ def get_ticket_audit_logs(conn: sqlite3.Connection, ticket_id: int = None,
             r.pop("config_diff_json", None)
         results.append(r)
     return results
+
+
+def add_ticket_audit_log(conn: sqlite3.Connection, action: str,
+                        ticket_id: int = None, ticket_title: str = None,
+                        source_batch_id: int = None, source_run_id: int = None,
+                        assignee: str = None,
+                        conflict_type: str = None,
+                        conflict_action: str = None,
+                        original_title: str = None,
+                        final_title: str = None,
+                        original_ticket_id: int = None,
+                        imported_from: str = None,
+                        result: str = AUDIT_RESULT_SUCCESS,
+                        trigger_method: str = AUDIT_TRIGGER_CLI,
+                        error_message: str = None) -> int:
+    """
+    统一工单审计日志写入函数。收拢所有 ticket_* 操作的审计记录，
+    确保冲突类型、处理决策、追溯字段完整落到审计日志中。
+    """
+    details = {}
+    if ticket_id is not None:
+        details["ticket_id"] = ticket_id
+    if ticket_title is not None:
+        details["ticket_title"] = ticket_title
+    if source_batch_id is not None:
+        details["source_batch_id"] = source_batch_id
+    if source_run_id is not None:
+        details["source_run_id"] = source_run_id
+    if assignee is not None:
+        details["assignee"] = assignee
+    if conflict_type is not None:
+        details["conflict_type"] = conflict_type
+    if conflict_action is not None:
+        details["conflict_action"] = conflict_action
+    if original_title is not None:
+        details["original_title"] = original_title
+    if final_title is not None:
+        details["final_title"] = final_title
+    if original_ticket_id is not None:
+        details["original_ticket_id"] = original_ticket_id
+    if imported_from is not None:
+        details["imported_from"] = imported_from
+
+    config_diff = details if details else None
+
+    return add_scheme_audit_log(
+        conn,
+        batch_id=source_batch_id,
+        action=action,
+        trigger_method=trigger_method,
+        result=result,
+        error_message=error_message,
+        config_diff=config_diff
+    )

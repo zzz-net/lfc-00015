@@ -112,13 +112,26 @@ python -m pipeline compare export 1 -o exports/ --format csv
 - `open`（待处理）→ `assigned`（已分配）→ `resolved`（已关闭）→ `reopened`（已重开）→ `assigned` / `resolved`
 - 创建时指定 `--assignee` 则直接进入 `assigned`
 
+**冲突检测（统一入口）：**
+导入工单时通过单一冲突检测入口判定，覆盖两类冲突（优先级：标题冲突 > 来源冲突）：
+- **标题冲突**：同标题工单已存在（`title_exists`）
+- **来源冲突**：相同 `source_batch_id` + `source_run_id` 的工单已存在（`source_exists`）
+
+**冲突处理策略：**
+- `reject`（默认）：检测到冲突时报错拒绝，不创建新工单，决定写入审计日志（result=blocked）
+- `rename`：自动重命名（添加后缀或指定 `--new-title`），创建新工单，冲突类型和处理决策写入审计日志
+
 **导入导出：**
 - 导出时把工单本体和完整处理历史（备注时间线）一起写入 JSON
-- 导入时遇到同标题或同来源冲突，支持 `reject`（拒绝）和 `rename`（自动重命名），决定写入审计日志
+- 导入结果 `TicketImportResult` 包含 `conflict_type`、`old_title`、`new_title`、`ticket_id`、`original_ticket_id` 等字段
+- 所有导入决策均同步落到导入结果对象和审计日志，两边信息一致
 
 **追溯字段：**
-- `original_ticket_id`: 导入工单的原始 ID（从原数据库导出时的 ID）
-- `imported_from`: 导入来源（文件名@导出时间）
+- `original_ticket_id`：导入工单的原始 ID，始终追溯到根原始工单（多次导出导入循环中保持一致）
+- `imported_from`：导入来源（文件名@导出时间）
+
+**审计日志：**
+所有工单操作（create/assign/resolve/reopen/export/import）均写入 `scheme_audit_log` 表，新增字段 `ticket_id`、`ticket_title`、`conflict_type`、`decision`、`config_diff` 用于关联查询，支持按操作类型和结果筛选。
 
 ## CLI 命令
 
@@ -230,6 +243,31 @@ python -m pipeline process 2
   INFO pipeline.service: 方案已克隆(链路): source_id=1, source_name='my_scheme', cloned_id=3, cloned_name='my_scheme_tuned'
   INFO pipeline.service: 克隆方案已应用到批次: scheme_id=3, scheme_name='my_scheme_tuned', batch_id=2, new_config_version=2
   ```
+
+### 复核工单管理
+
+```
+python -m pipeline ticket --help
+```
+
+| 命令 | 说明 |
+|------|------|
+| `ticket create TITLE [--source-batch-id N] [--source-run-id N] [--trigger-rule TEXT] [--assignee NAME] [--resolution TEXT] [--priority N] [--description TEXT]` | 创建复核工单 |
+| `ticket list [--status STATUS] [--assignee NAME] [--source-batch-id N] [--trigger-rule TEXT] [--limit N]` | 列出工单，支持多条件筛选 |
+| `ticket show TICKET_ID [--notes] [--audit]` | 显示工单详情，可选查看备注和审计日志 |
+| `ticket assign TICKET_ID ASSIGNEE` | 分配工单给责任人 |
+| `ticket resolve TICKET_ID RESOLUTION [--note TEXT]` | 关闭工单，填写解决结论 |
+| `ticket reopen TICKET_ID REASON` | 重新打开已关闭的工单 |
+| `ticket export TICKET_ID -o FILE.json` | 导出工单为 JSON 文件（含完整备注时间线） |
+| `ticket import FILE.json [--on-conflict reject|rename] [--new-title NAME]` | 从文件导入工单，支持冲突处理策略 |
+
+**ticket import 冲突检测与终端输出：**
+
+导入时统一检测"同标题或同来源"两类冲突，终端输出包含冲突类型和处理结果。
+
+冲突类型标签：
+- `title_exists` → 标题冲突
+- `source_exists` → 来源冲突（同 source_batch_id + source_run_id）
 
 ### 对比分析
 
@@ -348,3 +386,10 @@ python samples/regression_test.py
 - **基线审计日志链路**：注册/复核/导出/导入/删除 5 种动作均有审计记录，支持按操作类型筛选
 - **基线软删除**：删除后 status=deleted，历史记录和审计日志保留
 - **CLI baseline 命令**：register/check/export/list/show/import/history 帮助文本完整，输出与文档对齐
+- **工单创建后重启持久化**：创建工单+分配+关闭后重启，工单和备注时间线完整可查
+- **责任人筛选**：list --assignee 按责任人过滤正确
+- **关闭后重新打开**：resolve → reopen 流程完整，状态和备注时间线正确
+- **冲突导入-reject**：同标题导入时 reject 策略拒绝，审计日志记录
+- **冲突导入-rename**：同标题导入时 rename 策略重命名成功，保持 original_ticket_id 和 imported_from 追溯
+- **导入后继续处理**：导入后可继续分配、关闭、重开，处理历史连续
+- **历史追溯**：通过 notes 时间线和审计日志完整追溯工单全生命周期
