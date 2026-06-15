@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pipeline.service import (
     PipelineService, BatchLockedError, BatchServiceError,
     SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult,
-    SchemeDeriveResult, SchemeRollbackResult, DryRunResult, DryRunRisk
+    SchemeDeriveResult, SchemeRollbackResult, DryRunResult, DryRunRisk,
+    SwitchSchemeResult
 )
 from pipeline import database as db
 from pipeline.processor import import_csv
@@ -1455,8 +1456,10 @@ def run_tests():
             new_cfg = svc_h2.set_threshold(th_bid, zscore_threshold=1.5)
 
             hist_after = svc_h2.get_scheme_history(th_bid)
-            assert len(hist_after) == before_count + 1, \
-                f"set-threshold 后应新增 1 条历史，before={before_count}, after={len(hist_after)}"
+            non_baseline_after = [h for h in hist_after if h.get("action") != "baseline"]
+            non_baseline_before = [h for h in hist_before if h.get("action") != "baseline"]
+            assert len(non_baseline_after) == len(non_baseline_before) + 1, \
+                f"set-threshold 后应新增 1 条非 baseline 历史，before={len(non_baseline_before)}, after={len(non_baseline_after)}"
 
             latest = hist_after[0]
             assert latest["action"] == "direct", \
@@ -2209,6 +2212,329 @@ def run_tests():
         except Exception as e:
             r45.fail(str(e))
             print(f"  [FAIL] {r45.name}: {e}")
+
+        # ====== 测试 46: 回滚审计记录完整（成功/失败/阻止三种场景） ======
+        r46 = TestResult("测试46: 回滚成功/失败/阻止三种场景审计日志完整，含配置差异")
+        results.append(r46)
+        try:
+            svc_rb = PipelineService(db_path)
+
+            rb_base_bid = svc_rb.create_batch("rb46_base", SAMPLE_CSV)
+            svc_rb.process_batch(rb_base_bid)
+            rb_src_sid = svc_rb.save_scheme("rb46_source", batch_id=rb_base_bid)
+
+            rb_bid = svc_rb.create_batch("rb46_target", SAMPLE_CSV)
+            svc_rb.process_batch(rb_bid)
+            rb_cfg1 = svc_rb.apply_scheme_to_batch(rb_src_sid, rb_bid)
+
+            rb_result = svc_rb.rollback_scheme(rb_bid)
+            assert rb_result.success, "回滚应成功"
+
+            rb_success_logs = svc_rb.get_scheme_audit_logs(
+                batch_id=rb_bid, action="rollback", result="success")
+            assert len(rb_success_logs) >= 1, "成功回滚应记录审计日志"
+            rbsl = rb_success_logs[0]
+            assert rbsl["action"] == "rollback"
+            assert rbsl["result"] == "success"
+            assert rbsl["trigger_method"] == "cli"
+            assert rbsl["previous_config"] is not None
+            assert rbsl["new_config"] is not None
+            assert rbsl["config_diff"] is not None
+            assert rbsl["error_message"] is None
+            assert rbsl["config_diff"]["version_change"]["new"] == rb_result.new_config_version
+            assert rb_result.config_diff is not None, "rollback 返回值应含 config_diff"
+
+            rb_lock_bid = svc_rb.create_batch("rb46_lock_target", SAMPLE_CSV)
+            svc_rb.process_batch(rb_lock_bid)
+            svc_rb.apply_scheme_to_batch(rb_src_sid, rb_lock_bid)
+            svc_rb.lock_batch(rb_lock_bid)
+
+            try:
+                svc_rb.rollback_scheme(rb_lock_bid)
+                assert False, "锁定回滚应抛出 BatchLockedError"
+            except BatchLockedError:
+                pass
+
+            rb_blocked_logs = svc_rb.get_scheme_audit_logs(
+                batch_id=rb_lock_bid, action="rollback", result="blocked")
+            assert len(rb_blocked_logs) >= 1, "锁定回滚阻止应记录审计日志"
+            rbbl = rb_blocked_logs[0]
+            assert rbbl["result"] == "blocked"
+            assert rbbl["error_message"] is not None
+            assert "锁定" in rbbl["error_message"]
+            assert rbbl["previous_config"] is not None
+            assert rbbl.get("new_config") is None
+
+            svc_rb.unlock_batch(rb_lock_bid)
+
+            rb_no_hist_bid = svc_rb.create_batch("rb46_no_hist", SAMPLE_CSV)
+            svc_rb.process_batch(rb_no_hist_bid)
+            rb_no_hist_result = svc_rb.rollback_scheme(rb_no_hist_bid)
+            assert not rb_no_hist_result.success, "无历史回滚应失败"
+
+            rb_failed_logs = svc_rb.get_scheme_audit_logs(
+                batch_id=rb_no_hist_bid, action="rollback", result="failed")
+            assert len(rb_failed_logs) >= 1, "失败回滚应记录审计日志"
+            rbfl = rb_failed_logs[0]
+            assert rbfl["result"] == "failed"
+            assert rbfl["error_message"] is not None
+            assert ("历史记录" in rbfl["error_message"] or "最早" in rbfl["error_message"])
+
+            r46.ok()
+            print(f"  [PASS] {r46.name}  (成功/阻止/失败 3 场景均有审计)")
+        except Exception as e:
+            r46.fail(str(e))
+            print(f"  [FAIL] {r46.name}: {e}")
+
+        # ====== 测试 47: switch_scheme 四种模式（apply/clone/derive/rollback）流水完整 ======
+        r47 = TestResult("测试47: switch_scheme apply/clone/derive/rollback 四种模式预检→执行流水完整")
+        results.append(r47)
+        try:
+            svc_sw = PipelineService(db_path)
+
+            sw_base_bid = svc_sw.create_batch("sw_base", SAMPLE_CSV)
+            svc_sw.process_batch(sw_base_bid)
+            sw_src_sid = svc_sw.save_scheme("sw_source", batch_id=sw_base_bid)
+
+            # 1) apply 模式
+            sw_apply_bid = svc_sw.create_batch("sw_apply", SAMPLE_CSV)
+            svc_sw.process_batch(sw_apply_bid)
+            sw_apply_dr = svc_sw.switch_scheme(
+                SwitchSchemeResult.SWITCH_TYPE_APPLY, sw_apply_bid,
+                scheme_id=sw_src_sid, dry_run_only=True)
+            assert sw_apply_dr.success == sw_apply_dr.dry_run.can_proceed
+            assert sw_apply_dr.dry_run is not None
+            assert sw_apply_dr.switch_type == SwitchSchemeResult.SWITCH_TYPE_APPLY
+
+            sw_apply_ex = svc_sw.switch_scheme(
+                SwitchSchemeResult.SWITCH_TYPE_APPLY, sw_apply_bid,
+                scheme_id=sw_src_sid, dry_run_only=False)
+            assert sw_apply_ex.success
+            assert sw_apply_ex.new_config is not None
+            assert sw_apply_ex.new_config_version > sw_apply_ex.dry_run.current_config_version
+
+            # 2) clone 模式
+            sw_clone_bid = svc_sw.create_batch("sw_clone", SAMPLE_CSV)
+            svc_sw.process_batch(sw_clone_bid)
+            sw_clone_result = svc_sw.switch_scheme(
+                SwitchSchemeResult.SWITCH_TYPE_CLONE, sw_clone_bid,
+                source_scheme_id=sw_src_sid, new_scheme_name="sw_cloned_scheme")
+            assert sw_clone_result.success
+            assert sw_clone_result.new_scheme_id is not None
+            assert sw_clone_result.new_scheme_name == "sw_cloned_scheme"
+            assert sw_clone_result.new_config is not None
+
+            # 3) derive 模式
+            sw_derive_bid = svc_sw.create_batch("sw_derive", SAMPLE_CSV)
+            svc_sw.process_batch(sw_derive_bid)
+            sw_derive_result = svc_sw.switch_scheme(
+                SwitchSchemeResult.SWITCH_TYPE_DERIVE, sw_derive_bid,
+                source_scheme_id=sw_src_sid, new_scheme_name="sw_derived_scheme")
+            assert sw_derive_result.success
+            assert sw_derive_result.new_scheme_id is not None
+
+            # 4) rollback 模式
+            sw_rb_result = svc_sw.switch_scheme(
+                SwitchSchemeResult.SWITCH_TYPE_ROLLBACK, sw_apply_bid)
+            assert sw_rb_result.success
+            assert sw_rb_result.rollback_result is not None
+            assert sw_rb_result.rollback_result.success
+            assert sw_rb_result.rollback_result.previous_config_version == sw_apply_ex.new_config["version"]
+
+            # 5) 预检拦截：apply 到锁定批次
+            sw_block_bid = svc_sw.create_batch("sw_block", SAMPLE_CSV)
+            svc_sw.process_batch(sw_block_bid)
+            svc_sw.lock_batch(sw_block_bid)
+            sw_block_result = svc_sw.switch_scheme(
+                SwitchSchemeResult.SWITCH_TYPE_APPLY, sw_block_bid,
+                scheme_id=sw_src_sid, dry_run_only=True)
+            assert not sw_block_result.success
+            assert not sw_block_result.dry_run.can_proceed
+            lock_risk = [r for r in sw_block_result.dry_run.risks
+                         if r.risk_type == DryRunRisk.RISK_LOCKED]
+            assert len(lock_risk) >= 1
+
+            svc_sw.unlock_batch(sw_block_bid)
+
+            # 6) 4 种模式均有审计日志
+            for (bid, act) in [(sw_apply_bid, "apply"), (sw_clone_bid, "clone_apply"),
+                               (sw_derive_bid, "derive_apply"), (sw_apply_bid, "rollback")]:
+                logs = svc_sw.get_scheme_audit_logs(batch_id=bid, action=act, result="success")
+                assert len(logs) >= 1, f"switch {act} 应有审计日志"
+
+            r47.ok()
+            print(f"  [PASS] {r47.name}  (apply/clone/derive/rollback + 拦截 + 审计)")
+        except Exception as e:
+            r47.fail(str(e))
+            print(f"  [FAIL] {r47.name}: {e}")
+
+        # ====== 测试 48: 回滚前后结果变化正确（配置版本/当前方案/配置值） ======
+        r48 = TestResult("测试48: 回滚前后配置版本、当前方案、配置值正确变化")
+        results.append(r48)
+        try:
+            svc_rb2 = PipelineService(db_path)
+
+            rb2_base_bid = svc_rb2.create_batch("rb48_base", SAMPLE_CSV)
+            svc_rb2.process_batch(rb2_base_bid)
+            rb2_scheme1_sid = svc_rb2.save_scheme("rb48_scheme1", batch_id=rb2_base_bid)
+
+            rb2_target_bid = svc_rb2.create_batch("rb48_target", SAMPLE_CSV)
+            svc_rb2.process_batch(rb2_target_bid)
+            rb2_before_cfg = svc_rb2.get_batch(rb2_target_bid)
+            rb2_before_version = json.loads(rb2_before_cfg["config_json"])["version"]
+            rb2_before_scheme_id = rb2_before_cfg.get("current_scheme_id")
+
+            svc_rb2.apply_scheme_to_batch(rb2_scheme1_sid, rb2_target_bid)
+            rb2_after_apply_cfg = svc_rb2.get_batch(rb2_target_bid)
+            rb2_after_apply_json = json.loads(rb2_after_apply_cfg["config_json"])
+            rb2_after_apply_version = rb2_after_apply_json["version"]
+            rb2_after_apply_scheme_id = rb2_after_apply_cfg["current_scheme_id"]
+            rb2_after_apply_threshold = rb2_after_apply_json["anomaly_detection"]["zscore_threshold"]
+            assert rb2_after_apply_version > rb2_before_version
+            assert rb2_after_apply_scheme_id == rb2_scheme1_sid
+
+            rb2_rollback_result = svc_rb2.rollback_scheme(rb2_target_bid)
+            assert rb2_rollback_result.success
+            assert rb2_rollback_result.new_config_version > rb2_after_apply_version
+            assert rb2_rollback_result.previous_config_version == rb2_after_apply_version
+            assert rb2_rollback_result.previous_scheme_id == rb2_scheme1_sid
+
+            rb2_after_rb_cfg = svc_rb2.get_batch(rb2_target_bid)
+            rb2_after_rb_json = json.loads(rb2_after_rb_cfg["config_json"])
+            assert rb2_after_rb_json["version"] == rb2_rollback_result.new_config_version
+            assert rb2_after_rb_cfg["current_scheme_id"] == rb2_before_scheme_id
+            assert rb2_after_rb_cfg["current_scheme_name"] == rb2_before_cfg.get("current_scheme_name")
+
+            rb2_rb_audit = svc_rb2.get_scheme_audit_logs(
+                batch_id=rb2_target_bid, action="rollback", result="success")
+            assert len(rb2_rb_audit) >= 1
+            cd = rb2_rb_audit[0]["config_diff"]
+            assert cd["version_change"]["old"] == rb2_after_apply_version
+            assert cd["version_change"]["new"] == rb2_rollback_result.new_config_version
+
+            r48.ok()
+            print(f"  [PASS] {r48.name}  (v{rb2_before_version}→v{rb2_after_apply_version}→v{rb2_rollback_result.new_config_version})")
+        except Exception as e:
+            r48.fail(str(e))
+            print(f"  [FAIL] {r48.name}: {e}")
+
+        # ====== 测试 49: rollback dry-run 拦截生效（锁定/无历史/批次不存在） ======
+        r49 = TestResult("测试49: rollback dry-run 预检拦截（锁定批次、无历史、批次不存在）")
+        results.append(r49)
+        try:
+            svc_rb3 = PipelineService(db_path)
+
+            # 锁定批次
+            rb3_lock_bid = svc_rb3.create_batch("rb3_lock", SAMPLE_CSV)
+            svc_rb3.process_batch(rb3_lock_bid)
+            rb3_lock_sid = svc_rb3.save_scheme("rb3_lock_scheme", batch_id=rb3_lock_bid)
+            svc_rb3.apply_scheme_to_batch(rb3_lock_sid, rb3_lock_bid)
+            svc_rb3.lock_batch(rb3_lock_bid)
+
+            dr1 = svc_rb3.dry_run_rollback_scheme(rb3_lock_bid)
+            assert not dr1.can_proceed, "锁定批次 rollback dry-run 应阻止"
+            lock_risks = [r for r in dr1.risks if r.risk_type == DryRunRisk.RISK_LOCKED]
+            assert len(lock_risks) >= 1
+
+            svc_rb3.unlock_batch(rb3_lock_bid)
+
+            # 无历史（无 scheme_history）
+            rb3_nohist_bid = svc_rb3.create_batch("rb3_nohist", SAMPLE_CSV)
+            svc_rb3.process_batch(rb3_nohist_bid)
+            dr2 = svc_rb3.dry_run_rollback_scheme(rb3_nohist_bid)
+            assert not dr2.can_proceed, "无历史时 rollback dry-run 应阻止"
+
+            # 批次不存在
+            dr3 = svc_rb3.dry_run_rollback_scheme(999999)
+            assert not dr3.can_proceed, "批次不存在时 rollback dry-run 应阻止"
+            not_found_risks = [r for r in dr3.risks if r.risk_type == DryRunRisk.RISK_BATCH_NOT_FOUND]
+            assert len(not_found_risks) >= 1
+
+            # 正常可回滚：先 apply 方案再 set_threshold，rollback 目标就是 apply 记录（含方案）
+            rb3_ok_bid = svc_rb3.create_batch("rb3_ok", SAMPLE_CSV)
+            svc_rb3.process_batch(rb3_ok_bid)
+            rb3_ok_sid = svc_rb3.save_scheme("rb3_ok_scheme", batch_id=rb3_ok_bid)
+            svc_rb3.apply_scheme_to_batch(rb3_ok_sid, rb3_ok_bid)
+            svc_rb3.set_threshold(rb3_ok_bid, zscore_threshold=2.5)
+            dr4 = svc_rb3.dry_run_rollback_scheme(rb3_ok_bid)
+            assert dr4.can_proceed, "有历史时 rollback dry-run 应通过"
+            assert dr4.config_diff is not None
+            assert dr4.new_config_version is not None
+            assert dr4.current_config_version is not None
+            assert dr4.scheme_id is not None or dr4.scheme_name is not None
+
+            r49.ok()
+            print(f"  [PASS] {r49.name}  (锁定/无历史/批次不存在 3 种场景均拦截，有历史时通过)")
+        except Exception as e:
+            r49.fail(str(e))
+            print(f"  [FAIL] {r49.name}: {e}")
+
+        # ====== 测试 50: CLI switch、rollback --dry-run、rollback-dry-run 输出对齐 ======
+        r50 = TestResult("测试50: CLI scheme switch / rollback --dry-run / rollback-dry-run 输出对齐")
+        results.append(r50)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+            runner = CliRunner()
+            svc_cli5 = PipelineService(db_path)
+
+            cli5_bid = svc_cli5.create_batch("cli5_switch", SAMPLE_CSV)
+            svc_cli5.process_batch(cli5_bid)
+            cli5_sid = svc_cli5.save_scheme("cli5_scheme", batch_id=cli5_bid)
+
+            sw_help = runner.invoke(cli, ["scheme", "switch", "--help"])
+            assert sw_help.exit_code == 0
+            assert "SWITCH_TYPE" in sw_help.output
+            assert "apply" in sw_help.output
+            assert "rollback" in sw_help.output
+            assert "--dry-run" in sw_help.output
+
+            sw_apply_dr = runner.invoke(cli, ["--db", db_path, "scheme", "switch",
+                                              "apply", str(cli5_bid),
+                                              "--scheme-id", str(cli5_sid), "--dry-run"])
+            assert sw_apply_dr.exit_code == 0
+            assert "方案切换" in sw_apply_dr.output
+            assert "[预检]" in sw_apply_dr.output
+            assert "目标批次" in sw_apply_dr.output
+            assert "待应用方案" in sw_apply_dr.output
+            assert "预检通过" in sw_apply_dr.output
+
+            sw_apply_ex = runner.invoke(cli, ["--db", db_path, "scheme", "switch",
+                                              "apply", str(cli5_bid),
+                                              "--scheme-id", str(cli5_sid)])
+            assert sw_apply_ex.exit_code == 0
+            assert "切换成功" in sw_apply_ex.output
+            assert "配置变更预览" in sw_apply_ex.output
+            assert "process 命令" in sw_apply_ex.output
+
+            rb_dry = runner.invoke(cli, ["--db", db_path, "scheme", "rollback",
+                                         str(cli5_bid), "--dry-run"])
+            assert rb_dry.exit_code == 0
+            assert "[预检]" in rb_dry.output or "预检通过" in rb_dry.output or "方案切换" in rb_dry.output
+            assert "rollback" in rb_dry.output.lower() or "回滚" in rb_dry.output
+
+            rb_dry_cmd = runner.invoke(cli, ["--db", db_path, "scheme", "rollback-dry-run",
+                                              str(cli5_bid)])
+            assert rb_dry_cmd.exit_code == 0
+            assert "Dry-Run" in rb_dry_cmd.output or "预检结果" in rb_dry_cmd.output
+
+            rb_exec = runner.invoke(cli, ["--db", db_path, "scheme", "rollback",
+                                           str(cli5_bid)])
+            assert rb_exec.exit_code == 0
+            assert "切换成功" in rb_exec.output or "回滚详情" in rb_exec.output or "rollback" in rb_exec.output.lower()
+
+            svc_cli5.lock_batch(cli5_bid)
+            rb_blocked = runner.invoke(cli, ["--db", db_path, "scheme", "rollback",
+                                              str(cli5_bid), "--dry-run"])
+            assert rb_blocked.exit_code != 0, "锁定时 rollback --dry-run 应 exit!=0"
+            assert "检查未通过" in rb_blocked.output or "预检未通过" in rb_blocked.output or "ERROR" in rb_blocked.output
+            svc_cli5.unlock_batch(cli5_bid)
+
+            r50.ok()
+            print(f"  [PASS] {r50.name}  (switch/rollback 6 种 CLI 调用全部对齐)")
+        except Exception as e:
+            r50.fail(str(e))
+            print(f"  [FAIL] {r50.name}: {e}")
 
         # ====== 汇总 ======
         print()

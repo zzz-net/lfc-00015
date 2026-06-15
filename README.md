@@ -85,14 +85,16 @@ python -m pipeline scheme --help
 | `scheme save NAME [--batch-id N] [--config FILE] [--description TEXT]` | 保存方案，从批次或配置文件读取 |
 | `scheme list` | 列出所有方案 |
 | `scheme show SCHEME_ID` | 显示方案详情 |
-| `scheme apply SCHEME_ID BATCH_ID` | 将方案应用到未锁定批次（不自动重跑） |
+| `scheme apply SCHEME_ID BATCH_ID [--dry-run]` | 将方案应用到未锁定批次（不自动重跑），支持 --dry-run 预检 |
 | `scheme clone SOURCE_SCHEME_ID NEW_NAME [--description TEXT]` | 基于已有方案克隆出新方案，可改名称和描述 |
 | `scheme clone-apply SOURCE_SCHEME_ID NEW_NAME BATCH_ID [--description TEXT]` | 克隆方案并立即应用到未锁定批次（不自动重跑） |
 | `scheme derive SOURCE_SCHEME_ID NEW_NAME [--description TEXT]` | 基于已有方案派生出新方案，记录来源关系（source_scheme_id） |
 | `scheme derive-apply SOURCE_SCHEME_ID NEW_NAME BATCH_ID [--description TEXT]` | 派生方案并立即应用到未锁定批次，7步校验+步骤级日志 |
 | `scheme history BATCH_ID` | 查看批次的方案应用/回滚历史记录 |
-| `scheme rollback BATCH_ID` | 回滚批次到上一个配置版本（撤销最近一次方案应用或修改） |
-| `scheme dry-run SCHEME_ID BATCH_ID [--new-name NAME] [--source-scheme-id N]` | 预检查方案应用风险（不实际执行） |
+| `scheme rollback BATCH_ID [--dry-run]` | 回滚批次到上一个配置版本（撤销最近一次方案应用或修改），支持 --dry-run |
+| `scheme switch TYPE BATCH_ID [--scheme-id N] [--source-scheme-id N] [--new-name NAME] [--dry-run]` | 统一切换入口：apply/clone/derive/rollback，预检→确认→执行完整流水 |
+| `scheme dry-run SCHEME_ID BATCH_ID [--new-name NAME] [--source-scheme-id N]` | 预检查方案应用风险（不实际执行），含当前方案 vs 待切方案对比 |
+| `scheme rollback-dry-run BATCH_ID` | 回滚预检（不实际执行），预览回滚后的配置变化 |
 | `scheme audit-history [BATCH_ID] [--scheme-id N] [--action TYPE] [--result TYPE] [--limit N] [--diff]` | 查看方案应用审计历史（含配置差异、结果、失败原因） |
 | `scheme export SCHEME_ID -o FILE.json` | 导出方案为 JSON 文件 |
 | `scheme import FILE.json [--on-conflict ask\|overwrite\|rename\|skip] [--new-name NAME]` | 从文件导入方案 |
@@ -238,3 +240,10 @@ python samples/regression_test.py
 - 方案克隆并应用链路：成功克隆应用、同名冲突、锁定批次拒绝
 - 克隆后重启查询：克隆方案和应用后的配置版本持久化
 - 克隆方案与导出/导入的兼容性（克隆方案可正常导出并再导入）
+- **Dry-run 预检成功**：无风险时返回 can_proceed=True，配置变更预览正确
+- **Dry-run 预检拦截**：锁定批次、名称冲突、方案不存在等场景正确阻止
+- **执行成功后历史可查**：apply/clone-apply/derive-apply 成功后审计日志包含完整信息（配置差异、触发方式、结果）
+- **执行失败后历史可查**：失败/阻止场景审计日志包含错误原因，可通过 result=failed/blocked 筛选
+- **导入导出后历史连续**：方案导出再导入后，通过 original_id 保持关联，继续应用时历史不中断
+- **跨重启审计持久化**：重启后审计日志完整保留，可正常查询
+- **CLI 输出对齐**：dry-run 和 audit-history 命令输出与 README 文档一致

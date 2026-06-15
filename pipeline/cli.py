@@ -8,7 +8,7 @@ from tabulate import tabulate
 from .service import (
     PipelineService, BatchServiceError, BatchLockedError,
     SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult,
-    SchemeDeriveResult, DryRunResult, DryRunRisk
+    SchemeDeriveResult, DryRunResult, DryRunRisk, SwitchSchemeResult
 )
 from .config import get_default_config, load_config
 
@@ -25,6 +25,169 @@ def _print_table(rows, headers=None):
         click.echo("(无数据)")
         return
     click.echo(tabulate(rows, headers=headers or "keys", tablefmt="simple"))
+
+
+def _print_switch_result(sw: SwitchSchemeResult, label: str, is_dry_run: bool):
+    """统一输出 scheme switch 结果（含 dry-run 和执行结果）。"""
+    dr = sw.dry_run
+    click.echo(f"=== 方案切换 {'[预检]' if is_dry_run else ''}：{label} ===")
+
+    if dr:
+        if dr.batch_id:
+            click.echo(f"  目标批次:   #{dr.batch_id}" + (f" '{dr.batch_name}'" if dr.batch_name else ""))
+            if dr.batch_locked:
+                click.echo(f"             ⚠ 批次已锁定")
+        if dr.current_scheme_id:
+            click.echo(f"  当前方案:   #{dr.current_scheme_id}" +
+                       (f" '{dr.current_scheme_name}'" if dr.current_scheme_name else "") +
+                       (f" (v{dr.current_scheme_version})" if dr.current_scheme_version else ""))
+            if dr.current_config_version:
+                click.echo(f"  当前配置:   v{dr.current_config_version}")
+
+        if sw.switch_type == SwitchSchemeResult.SWITCH_TYPE_ROLLBACK:
+            if dr.scheme_id:
+                click.echo(f"  回滚到方案: #{dr.scheme_id}" +
+                           (f" '{dr.scheme_name}'" if dr.scheme_name else ""))
+        else:
+            if dr.scheme_id:
+                click.echo(f"  待应用方案: #{dr.scheme_id}" +
+                           (f" '{dr.scheme_name}'" if dr.scheme_name else "") +
+                           (f" (v{dr.scheme_version})" if dr.scheme_version else ""))
+            if dr.source_scheme_id:
+                click.echo(f"  源方案:     #{dr.source_scheme_id}" +
+                           (f" '{dr.source_scheme_name}'" if dr.source_scheme_name else ""))
+            if dr.new_scheme_name:
+                click.echo(f"  新方案名:   '{dr.new_scheme_name}'")
+
+        if dr.new_config_version:
+            click.echo(f"  新配置版本: v{dr.new_config_version}")
+
+        click.echo()
+
+        if not is_dry_run and not dr.can_proceed:
+            click.echo(f"{ERR} 预检未通过，执行终止", err=True)
+        elif is_dry_run and dr.can_proceed:
+            click.echo(f"{OK} 预检通过，可以继续执行")
+        elif is_dry_run and not dr.can_proceed:
+            click.echo(f"{ERR} 预检未通过，无法继续执行", err=True)
+        elif sw.success:
+            click.echo(f"{OK} 切换成功")
+
+        click.echo(f"  风险数量: {len(dr.risks)}")
+        if dr.risks:
+            click.echo("\n--- 风险详情 ---")
+            for i, risk in enumerate(dr.risks, 1):
+                severity_label = "阻止" if risk.severity == DryRunRisk.SEVERITY_BLOCKER else "警告"
+                click.echo(f"  {i}. [{severity_label}] {risk.risk_type}: {risk.message}")
+                if risk.details:
+                    for k, v in risk.details.items():
+                        click.echo(f"     {k}: {v}")
+
+        if dr.config_diff and dr.can_proceed:
+            click.echo("\n--- 配置变更预览 ---")
+            cd = dr.config_diff
+            if cd.get("version_change"):
+                click.echo(f"  版本变化: v{cd['version_change']['old']} → v{cd['version_change']['new']}")
+            if cd.get("added"):
+                click.echo(f"  新增字段 ({len(cd['added'])}):")
+                for k, v in cd["added"].items():
+                    click.echo(f"    + {k} = {v}")
+            if cd.get("modified"):
+                click.echo(f"  修改字段 ({len(cd['modified'])}):")
+                for k, v in cd["modified"].items():
+                    click.echo(f"    ~ {k}: {v['old']} → {v['new']}")
+            if cd.get("removed"):
+                click.echo(f"  删除字段 ({len(cd['removed'])}):")
+                for k, v in cd["removed"].items():
+                    click.echo(f"    - {k} = {v}")
+
+    if not is_dry_run and sw.success:
+        if sw.rollback_result:
+            rb = sw.rollback_result
+            click.echo()
+            click.echo(f"{OK} 配置回滚成功")
+            click.echo(f"  原版本: v{rb.previous_config_version}")
+            click.echo(f"  新版本: v{rb.new_config_version}")
+            if rb.previous_scheme_id:
+                click.echo(f"  回滚到方案: #{rb.previous_scheme_id}" +
+                           (f" '{rb.previous_scheme_name}'" if rb.previous_scheme_name else ""))
+        click.echo("  请执行 process 命令以使用新配置重跑该批次。")
+
+    if sw.message:
+        click.echo()
+        if sw.success:
+            click.echo(f"  提示: {sw.message}")
+        else:
+            click.echo(f"  原因: {sw.message}", err=True)
+
+    click.echo()
+    if not (sw.success or (is_dry_run and dr and dr.can_proceed)):
+        sys.exit(1)
+
+
+def _print_dry_run_enhanced(result: DryRunResult):
+    """输出增强版 dry-run 信息。"""
+    click.echo(f"=== Dry-Run 检查结果 ===")
+    if result.batch_id:
+        click.echo(f"  目标批次:   #{result.batch_id}" +
+                   (f" '{result.batch_name}'" if result.batch_name else ""))
+        if result.batch_locked:
+            click.echo(f"             ⚠ 批次已锁定")
+    if result.current_scheme_id:
+        click.echo(f"  当前方案:   #{result.current_scheme_id}" +
+                   (f" '{result.current_scheme_name}'" if result.current_scheme_name else "") +
+                   (f" (v{result.current_scheme_version})" if result.current_scheme_version else ""))
+    if result.current_config_version:
+        click.echo(f"  当前配置:   v{result.current_config_version}")
+    if result.scheme_id:
+        click.echo(f"  待应用方案: #{result.scheme_id}" +
+                   (f" '{result.scheme_name}'" if result.scheme_name else "") +
+                   (f" (v{result.scheme_version})" if result.scheme_version else ""))
+    if result.source_scheme_id:
+        click.echo(f"  源方案:     #{result.source_scheme_id}" +
+                   (f" '{result.source_scheme_name}'" if result.source_scheme_name else ""))
+    if result.new_scheme_name:
+        click.echo(f"  新方案名:   '{result.new_scheme_name}'")
+    if result.new_config_version:
+        click.echo(f"  新配置版本: v{result.new_config_version}")
+    click.echo()
+
+    if result.can_proceed:
+        click.echo(f"{OK} 检查通过，可以继续执行")
+    else:
+        click.echo(f"{ERR} 检查未通过，无法继续执行", err=True)
+
+    click.echo(f"  风险数量: {len(result.risks)}")
+    if result.risks:
+        click.echo("\n--- 风险详情 ---")
+        for i, risk in enumerate(result.risks, 1):
+            severity_label = "阻止" if risk.severity == DryRunRisk.SEVERITY_BLOCKER else "警告"
+            click.echo(f"  {i}. [{severity_label}] {risk.risk_type}: {risk.message}")
+            if risk.details:
+                for k, v in risk.details.items():
+                    click.echo(f"     {k}: {v}")
+
+    if result.config_diff and result.can_proceed:
+        click.echo("\n--- 配置变更预览 ---")
+        cd = result.config_diff
+        if cd.get("version_change"):
+            click.echo(f"  版本变化: v{cd['version_change']['old']} → v{cd['version_change']['new']}")
+        if cd.get("added"):
+            click.echo(f"  新增字段 ({len(cd['added'])}):")
+            for k, v in cd["added"].items():
+                click.echo(f"    + {k} = {v}")
+        if cd.get("modified"):
+            click.echo(f"  修改字段 ({len(cd['modified'])}):")
+            for k, v in cd["modified"].items():
+                click.echo(f"    ~ {k}: {v['old']} → {v['new']}")
+        if cd.get("removed"):
+            click.echo(f"  删除字段 ({len(cd['removed'])}):")
+            for k, v in cd["removed"].items():
+                click.echo(f"    - {k} = {v}")
+
+    click.echo()
+    if not result.can_proceed:
+        sys.exit(1)
 
 
 @click.group()
@@ -421,14 +584,21 @@ def scheme_show(ctx, scheme_id):
 @scheme.command("apply")
 @click.argument("scheme_id", type=int)
 @click.argument("batch_id", type=int)
+@click.option("--dry-run", is_flag=True, help="仅执行预检，不实际修改")
 @click.pass_context
-def scheme_apply(ctx, scheme_id, batch_id):
-    """将方案配置应用到未锁定批次（不自动重跑）"""
+def scheme_apply(ctx, scheme_id, batch_id, dry_run):
+    """将方案配置应用到未锁定批次（不自动重跑）。
+
+    使用 --dry-run 可仅执行预检，不实际修改。完整的预检→执行流水推荐使用 switch 命令。"""
     svc = _get_service(ctx.obj.get("db_path"))
     try:
-        new_cfg = svc.apply_scheme_to_batch(scheme_id, batch_id)
-        click.echo(f"{OK} 方案已应用到批次 {batch_id}，配置版本升至 v{new_cfg['version']}")
-        click.echo("  请执行 process 命令以使用新配置重跑该批次。")
+        sw = svc.switch_scheme(
+            SwitchSchemeResult.SWITCH_TYPE_APPLY,
+            batch_id,
+            scheme_id=scheme_id,
+            dry_run_only=dry_run
+        )
+        _print_switch_result(sw, "apply", dry_run)
     except BatchLockedError as e:
         click.echo(f"{ERR} {e}", err=True)
         sys.exit(1)
@@ -673,30 +843,22 @@ def scheme_history(ctx, batch_id):
 
 @scheme.command("rollback")
 @click.argument("batch_id", type=int)
+@click.option("--dry-run", is_flag=True, help="仅执行回滚预检，不实际执行")
 @click.pass_context
-def scheme_rollback(ctx, batch_id):
+def scheme_rollback(ctx, batch_id, dry_run):
     """回滚批次到上一个配置版本（撤销最近一次方案应用或修改）。
 
     锁定批次拒绝回滚，回滚后配置版本号递增（回滚本身也是一次变更）。
-    回滚操作会记录到历史中，可追溯。
-    成功后终端输出：原配置版本、新配置版本、回滚到的方案信息。
-    日志位置：Logger=pipeline.service，级别=INFO。"""
+    回滚操作会记录到历史和审计日志中，可追溯。
+    --dry-run 仅预览，不实际修改。"""
     svc = _get_service(ctx.obj.get("db_path"))
     try:
-        result = svc.rollback_scheme(batch_id)
-        if result.success:
-            click.echo(f"{OK} 配置回滚成功")
-            click.echo(f"  批次:       ID={batch_id}")
-            click.echo(f"  原版本:     v{result.previous_config_version}")
-            click.echo(f"  新版本:     v{result.new_config_version}")
-            if result.previous_scheme_id:
-                click.echo(f"  回滚到方案: ID={result.previous_scheme_id}, 名称='{result.previous_scheme_name}'")
-            else:
-                click.echo(f"  回滚到方案: (无方案关联的配置版本)")
-            click.echo("  请执行 process 命令以使用回滚后的配置重跑该批次。")
-        else:
-            click.echo(f"{ERR} 无法回滚: {result.message}", err=True)
-            sys.exit(1)
+        sw = svc.switch_scheme(
+            SwitchSchemeResult.SWITCH_TYPE_ROLLBACK,
+            batch_id,
+            dry_run_only=dry_run
+        )
+        _print_switch_result(sw, "rollback", dry_run)
     except BatchLockedError as e:
         click.echo(f"{ERR} {e}", err=True)
         sys.exit(1)
@@ -715,9 +877,8 @@ def scheme_dry_run(ctx, scheme_id, batch_id, new_name, source_scheme_id):
     """预检查方案应用风险，不实际修改任何数据。
 
     检查项：批次存在、方案存在、批次未锁定、新名称不冲突、源方案存在、版本兼容、配置完整。
-    返回能否继续执行及具体原因。
-    结果会记录到审计日志中，可通过 audit-history 查询。
-    日志位置：Logger=pipeline.service，级别=INFO。"""
+    输出：当前生效方案 vs 待切换方案的对比、版本差异、配置变更预览、风险详情。
+    结果会记录到审计日志中，可通过 audit-history 查询。"""
     svc = _get_service(ctx.obj.get("db_path"))
     try:
         result = svc.dry_run_apply_scheme(
@@ -726,54 +887,65 @@ def scheme_dry_run(ctx, scheme_id, batch_id, new_name, source_scheme_id):
             new_scheme_name=new_name,
             source_scheme_id=source_scheme_id
         )
-
-        click.echo(f"=== Dry-Run 检查结果 ===")
-        click.echo(f"  目标批次:   #{batch_id}")
-        click.echo(f"  待应用方案: #{scheme_id}" + (f" '{result.scheme_name}'" if result.scheme_name else ""))
-        if source_scheme_id:
-            click.echo(f"  源方案:     #{source_scheme_id}")
-        if new_name:
-            click.echo(f"  新方案名:   '{new_name}'")
-        click.echo()
-
-        if result.can_proceed:
-            click.echo(f"{OK} 检查通过，可以继续执行")
-        else:
-            click.echo(f"{ERR} 检查未通过，无法继续执行", err=True)
-
-        click.echo(f"  风险数量: {len(result.risks)}")
-        if result.risks:
-            click.echo("\n--- 风险详情 ---")
-            for i, risk in enumerate(result.risks, 1):
-                severity_label = "阻止" if risk.severity == DryRunRisk.SEVERITY_BLOCKER else "警告"
-                click.echo(f"  {i}. [{severity_label}] {risk.risk_type}: {risk.message}")
-                if risk.details:
-                    for k, v in risk.details.items():
-                        click.echo(f"     {k}: {v}")
-
-        if result.config_diff and result.can_proceed:
-            click.echo("\n--- 配置变更预览 ---")
-            cd = result.config_diff
-            if cd.get("version_change"):
-                click.echo(f"  版本变化: v{cd['version_change']['old']} → v{cd['version_change']['new']}")
-            if cd.get("added"):
-                click.echo(f"  新增字段 ({len(cd['added'])}):")
-                for k, v in cd["added"].items():
-                    click.echo(f"    + {k} = {v}")
-            if cd.get("modified"):
-                click.echo(f"  修改字段 ({len(cd['modified'])}):")
-                for k, v in cd["modified"].items():
-                    click.echo(f"    ~ {k}: {v['old']} → {v['new']}")
-            if cd.get("removed"):
-                click.echo(f"  删除字段 ({len(cd['removed'])}):")
-                for k, v in cd["removed"].items():
-                    click.echo(f"    - {k} = {v}")
-
-        click.echo()
-        if not result.can_proceed:
-            sys.exit(1)
-
+        _print_dry_run_enhanced(result)
     except (SchemeError, BatchServiceError) as e:
+        click.echo(f"{ERR} 错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("rollback-dry-run")
+@click.argument("batch_id", type=int)
+@click.pass_context
+def scheme_rollback_dry_run(ctx, batch_id):
+    """回滚预检：预览回滚结果，不实际执行。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.dry_run_rollback_scheme(batch_id)
+        _print_dry_run_enhanced(result)
+    except BatchServiceError as e:
+        click.echo(f"{ERR} 批次错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("switch")
+@click.argument("switch_type", type=click.Choice(["apply", "clone", "derive", "rollback"]))
+@click.argument("batch_id", type=int)
+@click.option("--scheme-id", type=int, default=None, help="待应用方案 ID（apply 模式必填）")
+@click.option("--source-scheme-id", type=int, default=None, help="源方案 ID（clone/derive 模式必填）")
+@click.option("--new-name", default=None, help="新方案名称（clone/derive 模式必填）")
+@click.option("--new-description", default=None, help="新方案描述（clone/derive 模式可选）")
+@click.option("--dry-run", is_flag=True, help="仅执行预检，不实际修改")
+@click.pass_context
+def scheme_switch(ctx, switch_type, batch_id, scheme_id, source_scheme_id,
+                  new_name, new_description, dry_run):
+    """方案切换统一入口：预检→确认→执行的完整流水。
+
+    SWITCH_TYPE:
+      apply    直接应用已有方案（需 --scheme-id）
+      clone    克隆源方案后应用（需 --source-scheme-id、--new-name）
+      derive   派生源方案后应用（需 --source-scheme-id、--new-name）
+      rollback 回滚到上一配置版本
+
+    统一输出：当前方案、待切方案、配置变更预览、风险详情、执行结果。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        type_map = {
+            "apply": SwitchSchemeResult.SWITCH_TYPE_APPLY,
+            "clone": SwitchSchemeResult.SWITCH_TYPE_CLONE,
+            "derive": SwitchSchemeResult.SWITCH_TYPE_DERIVE,
+            "rollback": SwitchSchemeResult.SWITCH_TYPE_ROLLBACK
+        }
+        sw = svc.switch_scheme(
+            switch_type=type_map[switch_type],
+            batch_id=batch_id,
+            scheme_id=scheme_id,
+            new_scheme_name=new_name,
+            new_description=new_description,
+            source_scheme_id=source_scheme_id,
+            dry_run_only=dry_run
+        )
+        _print_switch_result(sw, switch_type, dry_run)
+    except (BatchLockedError, SchemeError, BatchServiceError) as e:
         click.echo(f"{ERR} 错误: {e}", err=True)
         sys.exit(1)
 

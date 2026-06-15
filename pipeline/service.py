@@ -112,7 +112,8 @@ class SchemeRollbackResult:
     def __init__(self, success: bool, batch_id: int = None,
                  previous_config_version: int = None, new_config_version: int = None,
                  previous_scheme_id: int = None, previous_scheme_name: str = None,
-                 rolled_back_from_history_id: int = None, message: str = None):
+                 rolled_back_from_history_id: int = None, config_diff: dict = None,
+                 message: str = None):
         self.success = success
         self.batch_id = batch_id
         self.previous_config_version = previous_config_version
@@ -120,6 +121,7 @@ class SchemeRollbackResult:
         self.previous_scheme_id = previous_scheme_id
         self.previous_scheme_name = previous_scheme_name
         self.rolled_back_from_history_id = rolled_back_from_history_id
+        self.config_diff = config_diff
         self.message = message
 
 
@@ -148,19 +150,69 @@ class DryRunResult:
 
     def __init__(self, can_proceed: bool, risks: List[DryRunRisk] = None,
                  scheme_id: int = None, scheme_name: str = None,
-                 batch_id: int = None, source_scheme_id: int = None,
+                 scheme_version: str = None,
+                 batch_id: int = None, batch_name: str = None,
+                 batch_locked: bool = False,
+                 current_scheme_id: int = None,
+                 current_scheme_name: str = None,
+                 current_scheme_version: str = None,
+                 current_config_version: int = None,
+                 source_scheme_id: int = None,
+                 source_scheme_name: str = None,
+                 new_scheme_name: str = None,
                  previous_config: Dict[str, Any] = None,
                  new_config: Dict[str, Any] = None,
-                 config_diff: Dict[str, Any] = None):
+                 config_diff: Dict[str, Any] = None,
+                 new_config_version: int = None):
         self.can_proceed = can_proceed
         self.risks = risks or []
         self.scheme_id = scheme_id
         self.scheme_name = scheme_name
+        self.scheme_version = scheme_version
         self.batch_id = batch_id
+        self.batch_name = batch_name
+        self.batch_locked = batch_locked
+        self.current_scheme_id = current_scheme_id
+        self.current_scheme_name = current_scheme_name
+        self.current_scheme_version = current_scheme_version
+        self.current_config_version = current_config_version
         self.source_scheme_id = source_scheme_id
+        self.source_scheme_name = source_scheme_name
+        self.new_scheme_name = new_scheme_name
         self.previous_config = previous_config
         self.new_config = new_config
         self.config_diff = config_diff
+        self.new_config_version = new_config_version
+
+
+class SwitchSchemeResult:
+    """方案切换统一结果（包含预检和执行）"""
+
+    SWITCH_TYPE_APPLY = "apply"
+    SWITCH_TYPE_CLONE = "clone_apply"
+    SWITCH_TYPE_DERIVE = "derive_apply"
+    SWITCH_TYPE_ROLLBACK = "rollback"
+
+    def __init__(self, success: bool, switch_type: str,
+                 dry_run: DryRunResult = None,
+                 new_config: Dict[str, Any] = None,
+                 new_scheme_id: int = None,
+                 new_scheme_name: str = None,
+                 rollback_result: SchemeRollbackResult = None,
+                 message: str = None):
+        self.success = success
+        self.switch_type = switch_type
+        self.dry_run = dry_run
+        self.new_config = new_config
+        self.new_scheme_id = new_scheme_id
+        self.new_scheme_name = new_scheme_name
+        self.rollback_result = rollback_result
+        self.message = message
+        self.new_config_version = (
+            new_config.get("version")
+            if new_config
+            else (rollback_result.new_config_version if rollback_result else None)
+        )
 
 
 class SchemeAuditLogResult:
@@ -215,6 +267,17 @@ class PipelineService:
 
     # ========== 配置管理 ==========
 
+    @staticmethod
+    def _ensure_history_baseline(conn, batch_id: int, batch_cfg: Dict[str, Any]):
+        """确保批次在第一次记录历史前，先把初始配置存为 baseline。"""
+        latest = db.get_latest_scheme_history(conn, batch_id)
+        if latest is None:
+            db.add_scheme_history(
+                conn, batch_id, batch_cfg,
+                action="baseline",
+                scheme_id=None, scheme_name=None
+            )
+
     def update_config(self, batch_id: int, new_config: Dict[str, Any]) -> Dict[str, Any]:
         """更新批次配置（版本号自动递增），记录历史（direct 操作）"""
         conn = self._conn()
@@ -224,6 +287,9 @@ class PipelineService:
                 raise BatchServiceError(f"批次不存在: {batch_id}")
             if db.is_batch_locked(conn, batch_id):
                 raise BatchLockedError(f"批次 {batch_id} 已锁定，无法修改配置")
+
+            current_cfg = json.loads(batch["config_json"])
+            self._ensure_history_baseline(conn, batch_id, current_cfg)
 
             updated_cfg = bump_config_version(new_config)
             db.update_batch_config(conn, batch_id, updated_cfg)
@@ -664,6 +730,8 @@ class PipelineService:
                 raise BatchServiceError(f"批次不存在: {batch_id}")
             previous_config = json.loads(batch["config_json"])
 
+            self._ensure_history_baseline(conn, batch_id, previous_config)
+
             if db.is_batch_locked(conn, batch_id):
                 db.add_scheme_audit_log(
                     conn, batch_id=batch_id, action=db.AUDIT_ACTION_APPLY,
@@ -740,20 +808,36 @@ class PipelineService:
         finally:
             conn.close()
 
-    def rollback_scheme(self, batch_id: int) -> SchemeRollbackResult:
+    def rollback_scheme(self, batch_id: int,
+                        trigger_method: str = db.AUDIT_TRIGGER_CLI) -> SchemeRollbackResult:
         """
         回滚批次的配置到上一个版本。
         - 锁定批次不允许回滚
         - 如果没有历史记录，返回失败
         - 回滚后配置版本号递增（回滚也是一次配置变更）
-        - 回滚操作本身也会记录到历史中
+        - 回滚操作本身也会记录到历史和审计日志中
+        - 审计日志记录：前后配置、配置差异、触发方式、结果、失败原因
         """
         conn = self._conn()
         try:
             batch = db.get_batch(conn, batch_id)
             if not batch:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_ROLLBACK,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    error_message=f"批次不存在: {batch_id}"
+                )
                 raise BatchServiceError(f"批次不存在: {batch_id}")
+
+            previous_config = json.loads(batch["config_json"])
+
             if db.is_batch_locked(conn, batch_id):
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_ROLLBACK,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_BLOCKED,
+                    previous_config=previous_config,
+                    error_message=f"批次 {batch_id} 已锁定，无法回滚"
+                )
                 raise BatchLockedError(
                     f"批次 {batch_id} 已锁定，无法回滚配置。"
                     f"如需回滚，请先执行 unlock 解锁。"
@@ -761,6 +845,12 @@ class PipelineService:
 
             latest_history = db.get_latest_scheme_history(conn, batch_id)
             if not latest_history:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_ROLLBACK,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    previous_config=previous_config,
+                    error_message="没有可回滚的历史记录"
+                )
                 return SchemeRollbackResult(
                     success=False, batch_id=batch_id,
                     message="没有可回滚的历史记录"
@@ -771,9 +861,15 @@ class PipelineService:
             )
 
             if not previous_history:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_ROLLBACK,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    previous_config=previous_config,
+                    error_message="没有可回滚的历史记录"
+                )
                 return SchemeRollbackResult(
                     success=False, batch_id=batch_id,
-                    message="已经是最早的配置版本，无法再回滚"
+                    message="没有可回滚的历史记录"
                 )
 
             previous_cfg = previous_history["config"]
@@ -781,8 +877,13 @@ class PipelineService:
             rolled_back_cfg = copy.deepcopy(previous_cfg)
             rolled_back_cfg["version"] = current_version + 1
 
+            config_diff = db.compute_config_diff(previous_config, rolled_back_cfg)
+
             db.update_batch_config(
-                conn, batch_id, rolled_back_cfg,
+                conn, batch_id, rolled_back_cfg
+            )
+            db.update_batch_scheme_info(
+                conn, batch_id,
                 scheme_id=previous_history.get("scheme_id"),
                 scheme_name=previous_history.get("scheme_name")
             )
@@ -796,14 +897,25 @@ class PipelineService:
                 rolled_back_from_id=latest_history["id"]
             )
 
+            db.add_scheme_audit_log(
+                conn, batch_id=batch_id, action=db.AUDIT_ACTION_ROLLBACK,
+                trigger_method=trigger_method, result=db.AUDIT_RESULT_SUCCESS,
+                scheme_id=previous_history.get("scheme_id"),
+                scheme_name=previous_history.get("scheme_name"),
+                source_scheme_id=previous_history.get("source_scheme_id"),
+                previous_config=previous_config, new_config=rolled_back_cfg,
+                config_diff=config_diff
+            )
+
             result = SchemeRollbackResult(
                 success=True,
                 batch_id=batch_id,
                 previous_config_version=latest_history["config_version"],
                 new_config_version=rolled_back_cfg["version"],
-                previous_scheme_id=previous_history.get("scheme_id"),
-                previous_scheme_name=previous_history.get("scheme_name"),
+                previous_scheme_id=latest_history.get("scheme_id"),
+                previous_scheme_name=latest_history.get("scheme_name"),
                 rolled_back_from_history_id=latest_history["id"],
+                config_diff=config_diff,
                 message=f"已回滚到配置版本 v{rolled_back_cfg['version']}"
             )
 
@@ -811,8 +923,10 @@ class PipelineService:
                 f"方案已回滚: batch_id={batch_id}, "
                 f"from_version={latest_history['config_version']}, "
                 f"to_version={rolled_back_cfg['version']}, "
-                f"scheme_id={previous_history.get('scheme_id')}, "
-                f"scheme_name='{previous_history.get('scheme_name')}'"
+                f"from_scheme_id={latest_history.get('scheme_id')}, "
+                f"from_scheme_name='{latest_history.get('scheme_name')}', "
+                f"to_scheme_id={previous_history.get('scheme_id')}, "
+                f"to_scheme_name='{previous_history.get('scheme_name')}'"
             )
 
             return result
@@ -953,6 +1067,7 @@ class PipelineService:
             )
 
             previous_config = json.loads(batch["config_json"])
+            self._ensure_history_baseline(conn, batch_id, previous_config)
             new_cfg = bump_config_version(config)
             config_diff = db.compute_config_diff(previous_config, new_cfg)
 
@@ -1190,6 +1305,7 @@ class PipelineService:
             )
 
             previous_config = json.loads(batch["config_json"])
+            self._ensure_history_baseline(conn, batch_id, previous_config)
             new_cfg = bump_config_version(config)
             config_diff = db.compute_config_diff(previous_config, new_cfg)
 
@@ -1357,16 +1473,39 @@ class PipelineService:
                 f"can_proceed={can_proceed}, risks_count={len(risks)}"
             )
 
+            source_scheme_name = None
+            if source_scheme_id:
+                src = db.get_scheme(conn, source_scheme_id)
+                if src:
+                    source_scheme_name = src["name"]
+
             return DryRunResult(
                 can_proceed=can_proceed,
                 risks=risks,
                 scheme_id=scheme_id,
                 scheme_name=scheme["name"] if scheme else None,
+                scheme_version=scheme["scheme_version"] if scheme else None,
                 batch_id=batch_id,
+                batch_name=batch["name"] if batch else None,
+                batch_locked=db.is_batch_locked(conn, batch_id) if batch else False,
+                current_scheme_id=batch.get("current_scheme_id") if batch else None,
+                current_scheme_name=batch.get("current_scheme_name") if batch else None,
+                current_scheme_version=(
+                    db.get_scheme(conn, batch["current_scheme_id"])["scheme_version"]
+                    if batch and batch.get("current_scheme_id") else None
+                ),
+                current_config_version=(
+                    previous_config.get("version") if previous_config else None
+                ),
                 source_scheme_id=source_scheme_id,
+                source_scheme_name=source_scheme_name,
+                new_scheme_name=new_scheme_name,
                 previous_config=previous_config,
                 new_config=new_config,
-                config_diff=config_diff
+                config_diff=config_diff,
+                new_config_version=(
+                    new_config.get("version") if new_config else None
+                )
             )
         finally:
             conn.close()
@@ -1499,6 +1638,240 @@ class PipelineService:
                 return result
         finally:
             conn.close()
+
+    # ========== 方案切换流水 ==========
+
+    def dry_run_rollback_scheme(self, batch_id: int) -> DryRunResult:
+        """回滚预演：检查回滚可行性并预览变更（不实际执行）。"""
+        conn = self._conn()
+        try:
+            risks: List[DryRunRisk] = []
+            can_proceed = True
+
+            batch = db.get_batch(conn, batch_id)
+            if not batch:
+                risks.append(DryRunRisk(
+                    DryRunRisk.RISK_BATCH_NOT_FOUND,
+                    DryRunRisk.SEVERITY_BLOCKER,
+                    f"批次不存在: {batch_id}",
+                    {"batch_id": batch_id}
+                ))
+                can_proceed = False
+
+            previous_config = None
+            new_config = None
+            config_diff = None
+            current_config_version = None
+            target_config_version = None
+            current_scheme_id = None
+            current_scheme_name = None
+            target_scheme_id = None
+            target_scheme_name = None
+
+            if batch:
+                previous_config = json.loads(batch["config_json"])
+                current_config_version = previous_config.get("version")
+                current_scheme_id = batch.get("current_scheme_id")
+                current_scheme_name = batch.get("current_scheme_name")
+
+                if db.is_batch_locked(conn, batch_id):
+                    risks.append(DryRunRisk(
+                        DryRunRisk.RISK_LOCKED,
+                        DryRunRisk.SEVERITY_BLOCKER,
+                        f"批次 {batch_id} 已锁定，无法回滚",
+                        {"batch_id": batch_id, "batch_name": batch.get("name")}
+                    ))
+                    can_proceed = False
+
+                latest_history = db.get_latest_scheme_history(conn, batch_id)
+                if not latest_history:
+                    risks.append(DryRunRisk(
+                        "no_history",
+                        DryRunRisk.SEVERITY_BLOCKER,
+                        "没有可回滚的历史记录",
+                        {}
+                    ))
+                    can_proceed = False
+                else:
+                    previous_history = db.get_previous_scheme_history(
+                        conn, batch_id, latest_history["id"]
+                    )
+                    if not previous_history:
+                        risks.append(DryRunRisk(
+                            "already_first",
+                            DryRunRisk.SEVERITY_BLOCKER,
+                            "已经是最早的配置版本，无法再回滚",
+                            {"current_version": latest_history["config_version"]}
+                        ))
+                        can_proceed = False
+                    else:
+                        target_cfg = copy.deepcopy(previous_history["config"])
+                        target_cfg["version"] = latest_history["config_version"] + 1
+                        new_config = target_cfg
+                        target_config_version = target_cfg["version"]
+                        config_diff = db.compute_config_diff(previous_config, new_config)
+                        target_scheme_id = previous_history.get("scheme_id")
+                        target_scheme_name = previous_history.get("scheme_name")
+
+            result_for_audit = db.AUDIT_RESULT_SUCCESS if can_proceed else db.AUDIT_RESULT_BLOCKED
+            db.add_scheme_audit_log(
+                conn, batch_id=batch_id, action=db.AUDIT_ACTION_DRY_RUN,
+                trigger_method=db.AUDIT_TRIGGER_CLI, result=result_for_audit,
+                scheme_id=target_scheme_id, scheme_name=target_scheme_name,
+                previous_config=previous_config, new_config=new_config,
+                config_diff=config_diff,
+                error_message=None if can_proceed else "Rollback dry-run 检测到风险"
+            )
+
+            logger.info(
+                f"Rollback dry-run: batch_id={batch_id}, "
+                f"can_proceed={can_proceed}, risks_count={len(risks)}"
+            )
+
+            return DryRunResult(
+                can_proceed=can_proceed,
+                risks=risks,
+                scheme_id=target_scheme_id,
+                scheme_name=target_scheme_name,
+                batch_id=batch_id,
+                batch_name=batch["name"] if batch else None,
+                batch_locked=db.is_batch_locked(conn, batch_id) if batch else False,
+                current_scheme_id=current_scheme_id,
+                current_scheme_name=current_scheme_name,
+                current_config_version=current_config_version,
+                previous_config=previous_config,
+                new_config=new_config,
+                config_diff=config_diff,
+                new_config_version=target_config_version
+            )
+        finally:
+            conn.close()
+
+    def switch_scheme(self, switch_type: str, batch_id: int,
+                      scheme_id: int = None,
+                      new_scheme_name: str = None,
+                      new_description: str = None,
+                      source_scheme_id: int = None,
+                      trigger_method: str = db.AUDIT_TRIGGER_CLI,
+                      dry_run_only: bool = False) -> SwitchSchemeResult:
+        """
+        方案切换统一入口：预检→确认→执行的完整流水。
+
+        switch_type:
+          - apply:       直接应用已有方案 (scheme_id, batch_id)
+          - clone_apply: 克隆源方案后应用 (source_scheme_id, new_scheme_name, batch_id)
+          - derive_apply:派生源方案后应用 (source_scheme_id, new_scheme_name, batch_id)
+          - rollback:    回滚到上一配置版本 (batch_id)
+
+        dry_run_only=True 时仅预检，不实际执行。
+        """
+        if switch_type == SwitchSchemeResult.SWITCH_TYPE_ROLLBACK:
+            dr = self.dry_run_rollback_scheme(batch_id)
+            if dry_run_only or not dr.can_proceed:
+                return SwitchSchemeResult(
+                    success=dr.can_proceed,
+                    switch_type=switch_type,
+                    dry_run=dr,
+                    message=None if dr.can_proceed else "Rollback 预检未通过"
+                )
+            rb = self.rollback_scheme(batch_id, trigger_method=trigger_method)
+            return SwitchSchemeResult(
+                success=rb.success,
+                switch_type=switch_type,
+                dry_run=dr,
+                rollback_result=rb,
+                message=rb.message
+            )
+
+        if switch_type == SwitchSchemeResult.SWITCH_TYPE_APPLY:
+            if scheme_id is None:
+                raise SchemeError("apply 模式需要 scheme_id")
+            dr = self.dry_run_apply_scheme(scheme_id, batch_id)
+            if dry_run_only or not dr.can_proceed:
+                return SwitchSchemeResult(
+                    success=dr.can_proceed,
+                    switch_type=switch_type,
+                    dry_run=dr,
+                    message=None if dr.can_proceed else "Apply 预检未通过"
+                )
+            new_cfg = self.apply_scheme_to_batch(scheme_id, batch_id, trigger_method=trigger_method)
+            return SwitchSchemeResult(
+                success=True,
+                switch_type=switch_type,
+                dry_run=dr,
+                new_config=new_cfg,
+                new_scheme_id=scheme_id,
+                new_scheme_name=dr.scheme_name,
+                message=f"方案已应用，配置版本 v{new_cfg['version']}"
+            )
+
+        if switch_type == SwitchSchemeResult.SWITCH_TYPE_CLONE:
+            if source_scheme_id is None or new_scheme_name is None:
+                raise SchemeError("clone_apply 模式需要 source_scheme_id 和 new_scheme_name")
+            dr = self.dry_run_apply_scheme(
+                source_scheme_id, batch_id,
+                new_scheme_name=new_scheme_name,
+                source_scheme_id=source_scheme_id
+            )
+            if dry_run_only or not dr.can_proceed:
+                return SwitchSchemeResult(
+                    success=dr.can_proceed,
+                    switch_type=switch_type,
+                    dry_run=dr,
+                    message=None if dr.can_proceed else "Clone-apply 预检未通过"
+                )
+            cr = self.clone_and_apply_scheme(
+                source_scheme_id, new_scheme_name, batch_id,
+                new_description=new_description, trigger_method=trigger_method
+            )
+            new_cfg = None
+            if cr.success:
+                b = self.get_batch(batch_id)
+                new_cfg = json.loads(b["config_json"]) if b else None
+            return SwitchSchemeResult(
+                success=cr.success,
+                switch_type=switch_type,
+                dry_run=dr,
+                new_config=new_cfg,
+                new_scheme_id=cr.cloned_scheme_id,
+                new_scheme_name=new_scheme_name,
+                message=f"克隆方案已应用，配置版本 v{cr.new_config_version}" if cr.success else cr.message
+            )
+
+        if switch_type == SwitchSchemeResult.SWITCH_TYPE_DERIVE:
+            if source_scheme_id is None or new_scheme_name is None:
+                raise SchemeError("derive_apply 模式需要 source_scheme_id 和 new_scheme_name")
+            dr = self.dry_run_apply_scheme(
+                source_scheme_id, batch_id,
+                new_scheme_name=new_scheme_name,
+                source_scheme_id=source_scheme_id
+            )
+            if dry_run_only or not dr.can_proceed:
+                return SwitchSchemeResult(
+                    success=dr.can_proceed,
+                    switch_type=switch_type,
+                    dry_run=dr,
+                    message=None if dr.can_proceed else "Derive-apply 预检未通过"
+                )
+            der = self.derive_and_apply_scheme(
+                source_scheme_id, new_scheme_name, batch_id,
+                new_description=new_description, trigger_method=trigger_method
+            )
+            new_cfg = None
+            if der.success:
+                b = self.get_batch(batch_id)
+                new_cfg = json.loads(b["config_json"]) if b else None
+            return SwitchSchemeResult(
+                success=der.success,
+                switch_type=switch_type,
+                dry_run=dr,
+                new_config=new_cfg,
+                new_scheme_id=der.derived_scheme_id if der.success else None,
+                new_scheme_name=new_scheme_name,
+                message=f"派生方案已应用，配置版本 v{der.new_config_version}" if der.success else der.message
+            )
+
+        raise SchemeError(f"未知 switch_type: {switch_type}")
 
     # ========== 对比报告 ==========
 
