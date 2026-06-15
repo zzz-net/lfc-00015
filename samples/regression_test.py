@@ -944,8 +944,8 @@ def run_tests():
             r20.fail(str(e))
             print(f"  [FAIL] {r20.name}: {e}")
 
-        # ====== 测试 21: CLI scheme clone / clone-apply 帮助文本完整性 ======
-        r21 = TestResult("测试21: CLI scheme clone/clone-apply 帮助文本完整")
+        # ====== 测试 21: CLI scheme clone / clone-apply 帮助文本完整性（含规则说明） ======
+        r21 = TestResult("测试21: CLI scheme clone/clone-apply 帮助文本含规则和日志说明")
         results.append(r21)
         try:
             from click.testing import CliRunner
@@ -963,18 +963,179 @@ def run_tests():
             assert "source_scheme_id" in res_clone_help.output or "SOURCE_SCHEME_ID" in res_clone_help.output
             assert "new_name" in res_clone_help.output or "NEW_NAME" in res_clone_help.output
             assert "description" in res_clone_help.output
+            assert "name_exists" in res_clone_help.output or "同名" in res_clone_help.output, \
+                "clone --help 应说明同名冲突规则"
+            assert "pipeline.service" in res_clone_help.output, \
+                "clone --help 应标注 Logger 名称"
 
             res_clone_apply_help = runner.invoke(cli, ["scheme", "clone-apply", "--help"])
             assert res_clone_apply_help.exit_code == 0
             assert "source_scheme_id" in res_clone_apply_help.output or "SOURCE_SCHEME_ID" in res_clone_apply_help.output
             assert "new_name" in res_clone_apply_help.output or "NEW_NAME" in res_clone_apply_help.output
             assert "batch_id" in res_clone_apply_help.output or "BATCH_ID" in res_clone_apply_help.output
+            assert "锁定" in res_clone_apply_help.output and "拒绝" in res_clone_apply_help.output, \
+                "clone-apply --help 应说明锁定批次拒绝规则"
+            assert "不会创建新方案" in res_clone_apply_help.output or "原子" in res_clone_apply_help.output, \
+                "clone-apply --help 应说明原子性"
+            assert "pipeline.service" in res_clone_apply_help.output, \
+                "clone-apply --help 应标注 Logger 名称"
 
             r21.ok()
             print(f"  [PASS] {r21.name}")
         except Exception as e:
             r21.fail(str(e))
             print(f"  [FAIL] {r21.name}: {e}")
+
+        # ====== 测试 22: clone-apply 成功路径（按 README 流程终端输出匹配 + 日志） ======
+        r22 = TestResult("测试22: clone-apply 成功路径，终端输出含源/目标方案和批次，日志格式匹配文档")
+        results.append(r22)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+            import logging
+
+            runner = CliRunner()
+            svc_doc = PipelineService(db_path)
+
+            bid_doc1 = svc_doc.create_batch("doc_exp_001", SAMPLE_CSV)
+            svc_doc.process_batch(bid_doc1)
+            sid_doc = svc_doc.save_scheme("doc_my_scheme", batch_id=bid_doc1, description="文档基础方案")
+            bid_doc2 = svc_doc.create_batch("doc_exp_002", SAMPLE_CSV)
+            svc_doc.process_batch(bid_doc2)
+
+            log_records = []
+
+            class _CaptureHandler(logging.Handler):
+                def emit(self, record):
+                    log_records.append(record)
+
+            handler = _CaptureHandler()
+            handler.setLevel(logging.DEBUG)
+            svc_logger = logging.getLogger("pipeline.service")
+            original_level = svc_logger.level
+            svc_logger.addHandler(handler)
+            svc_logger.setLevel(logging.INFO)
+
+            try:
+                cli_params = ["--db", db_path, "scheme", "clone-apply",
+                              str(sid_doc), "doc_my_scheme_tuned", str(bid_doc2),
+                              "--description", "文档链路测试"]
+                res = runner.invoke(cli, cli_params)
+                assert res.exit_code == 0, f"clone-apply 应成功退出，exit={res.exit_code}, output={res.output}"
+
+                out = res.output
+                assert "[OK]" in out, "终端输出应包含 [OK] 标记"
+                assert "源方案" in out and "ID" in out and str(sid_doc) in out, \
+                    f"终端输出应列出源方案 ID，实际输出:\n{out}"
+                assert "doc_my_scheme" in out, f"终端输出应含源方案名，实际输出:\n{out}"
+                assert "新方案" in out and "doc_my_scheme_tuned" in out, \
+                    f"终端输出应含新方案名，实际输出:\n{out}"
+                assert "应用批次" in out and str(bid_doc2) in out, \
+                    f"终端输出应含应用批次 ID，实际输出:\n{out}"
+                assert "配置版本" in out and "v" in out, \
+                    f"终端输出应含配置版本，实际输出:\n{out}"
+                assert "process" in out, "终端输出应提示执行 process 重跑"
+
+                clone_logs = [r for r in log_records if "克隆" in r.getMessage() or "应用" in r.getMessage()]
+                assert len(clone_logs) >= 2, f"clone-apply 应产生至少 2 条 INFO 日志，实际 {len(clone_logs)} 条"
+
+                clone_msgs = [r.getMessage() for r in clone_logs if r.levelno == logging.INFO]
+                joined = " | ".join(clone_msgs)
+                assert str(sid_doc) in joined, f"日志应含源方案 ID，实际: {joined}"
+                assert "doc_my_scheme" in joined, f"日志应含源方案名，实际: {joined}"
+                assert "doc_my_scheme_tuned" in joined, f"日志应含新方案名，实际: {joined}"
+                assert str(bid_doc2) in joined, f"日志应含批次 ID，实际: {joined}"
+                assert "new_config_version" in joined or "配置" in joined, \
+                    f"日志应含配置版本，实际: {joined}"
+
+                source_exists = any(
+                    "source_id" in m and "source_name" in m and "cloned_id" in m and "cloned_name" in m
+                    for m in clone_msgs
+                )
+                assert source_exists, f"克隆链路日志应包含 source_id/source_name/cloned_id/cloned_name 模板字段，实际: {clone_msgs}"
+            finally:
+                svc_logger.removeHandler(handler)
+                svc_logger.setLevel(original_level)
+
+            batch_after = svc_doc.get_batch(bid_doc2)
+            assert batch_after["config_version"] >= 2, \
+                f"clone-apply 后批次配置版本应至少为 v2，实际 v{batch_after['config_version']}"
+
+            new_scheme = svc_doc.get_scheme_by_name("doc_my_scheme_tuned")
+            assert new_scheme is not None, "克隆出的新方案应存在"
+
+            r22.ok()
+            print(f"  [PASS] {r22.name}  (source_sid={sid_doc}, batch={bid_doc2}, cfg_v={batch_after['config_version']})")
+        except Exception as e:
+            r22.fail(str(e))
+            print(f"  [FAIL] {r22.name}: {e}")
+
+        # ====== 测试 23: clone-apply 锁定批次拒绝（不产生新方案） ======
+        r23 = TestResult("测试23: clone-apply 到锁定批次拒绝，不创建新方案，终端和日志符合文档")
+        results.append(r23)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+            import logging
+
+            runner = CliRunner()
+            svc_rej = PipelineService(db_path)
+
+            bid_lock = svc_rej.create_batch("lock_reject_batch", SAMPLE_CSV)
+            svc_rej.process_batch(bid_lock)
+            base_for_reject = svc_rej.create_batch("base_for_reject", SAMPLE_CSV)
+            svc_rej.process_batch(base_for_reject)
+            svc_rej.lock_batch(bid_lock)
+            base_sid = svc_rej.save_scheme("reject_base_scheme", batch_id=base_for_reject, description="拒绝测试源")
+
+            schemes_before = svc_rej.list_schemes()
+            before_names = {s["name"] for s in schemes_before}
+
+            log_records = []
+
+            class _CaptureHandler(logging.Handler):
+                def emit(self, record):
+                    log_records.append(record)
+
+            handler = _CaptureHandler()
+            handler.setLevel(logging.DEBUG)
+            svc_logger = logging.getLogger("pipeline.service")
+            original_level = svc_logger.level
+            svc_logger.addHandler(handler)
+            svc_logger.setLevel(logging.INFO)
+
+            try:
+                new_name = "should_not_exist_scheme"
+                res = runner.invoke(cli, ["--db", db_path, "scheme", "clone-apply",
+                                          str(base_sid), new_name, str(bid_lock)])
+                assert res.exit_code != 0, f"clone-apply 到锁定批次应 exit!=0，实际 {res.exit_code}"
+                out = res.output
+                assert "[ERROR]" in out, f"终端应输出 [ERROR]，实际输出:\n{out}"
+                assert "锁定" in out, f"终端输出应包含 '锁定'，实际:\n{out}"
+                assert "无法应用" in out or "拒绝" in out, f"终端应说明拒绝，实际:\n{out}"
+
+                clone_logs_after = [r for r in log_records if new_name in r.getMessage()]
+                assert len(clone_logs_after) == 0, \
+                    f"锁定拒绝时不应产生任何含新方案名的日志，实际: {[r.getMessage() for r in clone_logs_after]}"
+            finally:
+                svc_logger.removeHandler(handler)
+                svc_logger.setLevel(original_level)
+
+            schemes_after = svc_rej.list_schemes()
+            after_names = {s["name"] for s in schemes_after}
+            assert after_names == before_names, \
+                f"锁定拒绝时不应创建新方案，before={before_names}, after={after_names}"
+
+            assert svc_rej.get_scheme_by_name("should_not_exist_scheme") is None, \
+                "锁定拒绝时不应创建新方案记录"
+
+            svc_rej.unlock_batch(bid_lock)
+
+            r23.ok()
+            print(f"  [PASS] {r23.name}  (lock_batch={bid_lock}, scheme_count={len(schemes_after)})")
+        except Exception as e:
+            r23.fail(str(e))
+            print(f"  [FAIL] {r23.name}: {e}")
 
         # ====== 汇总 ======
         print()

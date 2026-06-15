@@ -493,7 +493,11 @@ def scheme_delete(ctx, scheme_id):
 @click.option("--description", default=None, help="新方案描述（不指定则沿用源方案）")
 @click.pass_context
 def scheme_clone(ctx, source_scheme_id, new_name, description):
-    """基于已有方案克隆出新方案，可改名称和描述"""
+    """基于已有方案克隆出新方案，可改名称和描述。
+
+    同名时直接报错（name_exists），不会自动覆盖或重命名。
+    克隆成功后终端输出源方案 ID/名称 和 新方案 ID/名称。
+    日志位置：Logger=pipeline.service，级别=INFO。"""
     svc = _get_service(ctx.obj.get("db_path"))
     try:
         cloned_id = svc.clone_scheme(source_scheme_id, new_name, description)
@@ -516,7 +520,13 @@ def scheme_clone(ctx, source_scheme_id, new_name, description):
 @click.option("--description", default=None, help="新方案描述（不指定则沿用源方案）")
 @click.pass_context
 def scheme_clone_apply(ctx, source_scheme_id, new_name, batch_id, description):
-    """克隆方案并立即应用到未锁定批次（不自动重跑）"""
+    """克隆方案并立即应用到未锁定批次（不自动重跑）。
+
+    原子性：先校验批次未锁定 + 新名称不冲突，再创建方案并应用。
+    锁定批次直接拒绝（不会创建新方案），与 scheme apply 规则一致。
+    同名时直接报错（name_exists），不会自动覆盖或重命名。
+    成功后终端输出：源方案 ID/名称、新方案 ID/名称、批次 ID、新配置版本。
+    日志位置：Logger=pipeline.service，级别=INFO（克隆一条 + 应用一条）。"""
     svc = _get_service(ctx.obj.get("db_path"))
     try:
         result = svc.clone_and_apply_scheme(source_scheme_id, new_name, batch_id, description)

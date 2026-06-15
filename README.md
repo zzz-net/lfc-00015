@@ -100,6 +100,59 @@ python -m pipeline scheme --help
 
 冲突类型包括：同名、字段缺失、主版本不兼容。
 
+### 方案克隆与应用链路使用说明
+
+```bash
+# 步骤 1：先有一个源方案
+python -m pipeline create exp_001 samples/sensor_data.csv
+python -m pipeline process 1
+python -m pipeline scheme save my_scheme --batch-id 1 --description "基础分析方案"
+
+# 步骤 2a：仅克隆（不关联批次）
+python -m pipeline scheme clone 1 my_scheme_v2 --description "方案第二版"
+# 终端输出:
+#   [OK] 方案克隆成功
+#     源方案:   ID=1
+#     新方案:   ID=2, 名称='my_scheme_v2'
+
+# 步骤 2b：克隆 + 一步应用到新批次（推荐，省掉 export/import 往返）
+python -m pipeline create exp_002 samples/sensor_data.csv
+python -m pipeline scheme clone-apply 1 my_scheme_tuned 2 --description "针对批次2调整"
+# 终端输出:
+#   [OK] 方案克隆并应用成功
+#     源方案:   ID=1, 名称='my_scheme'
+#     新方案:   ID=3, 名称='my_scheme_tuned'
+#     应用批次: ID=2, 配置版本升至 v2
+#   请执行 process 命令以使用新配置重跑该批次。
+
+# 后续：按提示重跑
+python -m pipeline process 2
+```
+
+**`clone` 规则：**
+- 新方案名称已存在 → 报错 `冲突(name_exists): 方案名称已存在: '...'`，详情含 `existing_scheme_id`、`source_scheme_id`、`source_scheme_name`
+- 不自动覆盖或重命名（需要改名请先手动改 `new_name` 或用 `scheme import --on-conflict rename`）
+
+**`clone-apply` 规则（原子操作，按以下顺序校验）：**
+1. 校验源方案存在；校验批次存在
+2. **锁定批次直接拒绝**（`[ERROR] 批次 N 已锁定，无法应用克隆方案。如需使用该方案进行对比分析，请使用 compare 命令...`），**不会创建新方案**
+3. 校验新名称不冲突；冲突则报错同上，不创建任何东西
+4. 通过以上校验后才创建新方案并 bump 配置版本应用到批次
+
+锁定批次拒绝规则与 `scheme apply` 完全一致。
+
+**日志定位：**
+- Logger 名称：`pipeline.service`，级别：`INFO`
+- `scheme clone` 产生 1 条日志：
+  ```
+  INFO pipeline.service: 方案已克隆: source_id=1, source_name='my_scheme', cloned_id=2, cloned_name='my_scheme_v2'
+  ```
+- `scheme clone-apply` 产生 2 条独立日志（克隆 + 应用各 1 条，方便筛选）：
+  ```
+  INFO pipeline.service: 方案已克隆(链路): source_id=1, source_name='my_scheme', cloned_id=3, cloned_name='my_scheme_tuned'
+  INFO pipeline.service: 克隆方案已应用到批次: scheme_id=3, scheme_name='my_scheme_tuned', batch_id=2, new_config_version=2
+  ```
+
 ### 对比分析
 
 ```
@@ -161,3 +214,7 @@ python samples/regression_test.py
 - 方案导入冲突（同名/字段缺失/版本不兼容）处理
 - 锁定批次参与对比分析（不被改写）
 - 报告导出字段稳定性（JSON/CSV 表头和值一致）
+- 方案克隆（仅克隆）成功克隆、同名冲突
+- 方案克隆并应用链路：成功克隆应用、同名冲突、锁定批次拒绝
+- 克隆后重启查询：克隆方案和应用后的配置版本持久化
+- 克隆方案与导出/导入的兼容性（克隆方案可正常导出并再导入）
