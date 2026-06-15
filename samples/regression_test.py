@@ -3041,6 +3041,543 @@ def run_tests():
             r59.fail(str(e))
             print(f"  [FAIL] {r59.name}: {e}")
 
+        # ====== 测试 60: 快照导出成功，ZIP 包结构完整
+        r60 = TestResult("测试60: 快照导出成功，ZIP 包含所有必需文件和校验和")
+        results.append(r60)
+        try:
+            svc_snap1 = PipelineService(db_path)
+
+            snap_batch_id = svc_snap1.create_batch("snap_export_test", SAMPLE_CSV)
+            svc_snap1.process_batch(snap_batch_id)
+
+            snap_dir = os.path.join(tmpdir, "snapshots")
+            os.makedirs(snap_dir, exist_ok=True)
+            snap_zip = os.path.join(snap_dir, "test_snapshot.zip")
+
+            result = svc_snap1.export_snapshot(
+                "test_snap_001", snap_batch_id, output_path=snap_zip)
+
+            assert result["snapshot_id"] > 0
+            assert os.path.exists(snap_zip), "ZIP 文件应存在"
+            assert os.path.getsize(snap_zip) > 0, "ZIP 文件不应为空"
+
+            import zipfile
+            with zipfile.ZipFile(snap_zip, "r") as zf:
+                file_list = zf.namelist()
+                required_files = ["manifest.json", "config.json", "metrics.json",
+                              "anomalies.json", "errors.json", "source_summary.json",
+                              "dependencies.json", "checksum.json"]
+                for req_file in required_files:
+                    assert req_file in file_list, f"ZIP 缺少必需文件: {req_file}"
+
+                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+                assert manifest["format_version"] == "1.0"
+                assert manifest["snapshot_type"] == "run"
+                assert "source" in manifest
+                assert "config" in manifest
+                assert "source_summary" in manifest
+                assert "metrics_summary" in manifest
+                assert "anomalies_summary" in manifest
+                assert "errors_summary" in manifest
+                assert "dependencies" in manifest
+                assert "checksums" in manifest
+
+                checksum_data = json.loads(zf.read("checksum.json").decode("utf-8"))
+                assert "files" in checksum_data
+                for fname in required_files:
+                    if fname != "checksum.json":
+                        assert fname in checksum_data["files"]
+
+            snap_record = svc_snap1.get_snapshot(result["snapshot_id"])
+            assert snap_record is not None
+            assert snap_record["name"] == "test_snap_001"
+            assert snap_record["status"] == "available"
+            assert snap_record["checksum_sha256"] == result["checksum_sha256"]
+            assert "python" in snap_record["manifest"]["dependencies"]
+            assert "pandas" in snap_record["manifest"]["dependencies"]
+            assert "snapshot_format" in snap_record["manifest"]["dependencies"]
+
+            r60.ok()
+            print(f"  [PASS] {r60.name}  (snapshot_id={result['snapshot_id']}, zip_size={os.path.getsize(snap_zip)})")
+        except Exception as e:
+            r60.fail(str(e))
+            print(f"  [FAIL] {r60.name}: {e}")
+
+        # ====== 测试 61: 导出后重启导入（跨数据库/重启后导入查看）
+        r61 = TestResult("测试61: 快照导出后重启导入，数据完整可查")
+        results.append(r61)
+        try:
+            svc_snap2 = PipelineService(db_path)
+
+            snap2_batch_id = svc_snap2.create_batch("snap_restart_src", SAMPLE_CSV)
+            svc_snap2.process_batch(snap2_batch_id)
+
+            snap2_zip = os.path.join(tmpdir, "snap_restart.zip")
+            export_result = svc_snap2.export_snapshot(
+                "snap_restart_test", snap2_batch_id, output_path=snap2_zip)
+            original_snap_id = export_result["snapshot_id"]
+
+            del svc_snap2
+
+            new_db_path = os.path.join(tmpdir, "restart_import.db")
+            svc_import = PipelineService(new_db_path)
+
+            import_result = svc_import.import_snapshot(snap2_zip)
+            assert import_result.success
+            assert import_result.snapshot_id > 0
+            assert import_result.imported_from is not None
+
+            imported_snap = svc_import.get_snapshot(import_result.snapshot_id)
+            assert imported_snap is not None
+            assert imported_snap["name"] == "snap_restart_src_snapshot" or import_result.final_name
+            assert imported_snap["original_batch_id"] == snap2_batch_id
+            assert imported_snap["imported_from"] is not None
+
+            manifest = imported_snap["manifest"]
+            assert manifest["source"]["original_batch_id"] == snap2_batch_id
+            assert manifest["source"]["original_batch_name"] == "snap_restart_src"
+            assert manifest["metrics_summary"]["total_metrics"] > 0
+
+            snap_list = svc_import.list_snapshots()
+            assert len(snap_list) == 1
+            assert snap_list[0]["id"] == import_result.snapshot_id
+
+            r61.ok()
+            print(f"  [PASS] {r61.name}  (original_id={original_snap_id}, imported_id={import_result.snapshot_id})")
+        except Exception as e:
+            r61.fail(str(e))
+            print(f"  [FAIL] {r61.name}: {e}")
+
+        # ====== 测试 62: 导入冲突 - reject 策略
+        r62 = TestResult("测试62: 导入冲突 - reject 策略正确拒绝同名快照")
+        results.append(r62)
+        try:
+            svc_snap3 = PipelineService(db_path)
+
+            snap3_batch_id = svc_snap3.create_batch("snap_reject_src", SAMPLE_CSV)
+            svc_snap3.process_batch(snap3_batch_id)
+
+            snap3_zip = os.path.join(tmpdir, "snap_reject.zip")
+            svc_snap3.export_snapshot("snap_reject_test", snap3_batch_id, output_path=snap3_zip)
+
+            import_result_ok = svc_snap3.import_snapshot(snap3_zip, on_conflict="reject")
+            assert import_result_ok.success, "首次导入应成功"
+
+            import_result_reject = svc_snap3.import_snapshot(snap3_zip, on_conflict="reject")
+            assert not import_result_reject.success, "reject 策略应返回 success=False"
+            assert import_result_reject.action == "reject"
+
+            audit_reject = svc_snap3.get_snapshot_audit_logs(action="snapshot_import", result="blocked")
+            assert len(audit_reject) >= 1, "reject 应记录审计日志"
+            assert "拒绝" in audit_reject[0]["error_message"] or "reject" in audit_reject[0]["error_message"].lower()
+
+            r62.ok()
+            print(f"  [PASS] {r62.name}  (reject 策略生效)")
+        except Exception as e:
+            r62.fail(str(e))
+            print(f"  [FAIL] {r62.name}: {e}")
+
+        # ====== 测试 63: 导入冲突 - rename 策略
+        r63 = TestResult("测试63: 导入冲突 - rename 策略自动重命名")
+        results.append(r63)
+        try:
+            svc_snap4 = PipelineService(db_path)
+
+            snap4_batch_id = svc_snap4.create_batch("snap_rename_src", SAMPLE_CSV)
+            svc_snap4.process_batch(snap4_batch_id)
+
+            snap4_zip = os.path.join(tmpdir, "snap_rename.zip")
+            svc_snap4.export_snapshot("snap_rename_test", snap4_batch_id, output_path=snap4_zip)
+
+            svc_snap4.import_snapshot(snap4_zip)
+
+            import_rename = svc_snap4.import_snapshot(snap4_zip, on_conflict="rename", new_name="renamed_snap_v2")
+            assert import_rename.success
+            assert import_rename.action == "rename"
+            assert import_rename.final_name == "renamed_snap_v2"
+            assert import_rename.original_name != import_rename.final_name
+
+            snap4_list = svc_snap4.list_snapshots()
+            snap4_names = [s["name"] for s in snap4_list]
+            assert "snap_rename_src_snapshot" in snap4_names
+            assert "renamed_snap_v2" in snap4_names
+
+            r63.ok()
+            print(f"  [PASS] {r63.name}  (自动重命名成功, final_name={import_rename.final_name})")
+        except Exception as e:
+            r63.fail(str(e))
+            print(f"  [FAIL] {r63.name}: {e}")
+
+        # ====== 测试 64: 导入冲突 - skip 策略
+        r64 = TestResult("测试64: 导入冲突 - skip 策略正确跳过")
+        results.append(r64)
+        try:
+            svc_snap5 = PipelineService(db_path)
+
+            snap5_batch_id = svc_snap5.create_batch("snap_skip_src", SAMPLE_CSV)
+            svc_snap5.process_batch(snap5_batch_id)
+
+            snap5_zip = os.path.join(tmpdir, "snap_skip.zip")
+            svc_snap5.export_snapshot("snap_skip_test", snap5_batch_id, output_path=snap5_zip)
+
+            svc_snap5.import_snapshot(snap5_zip)
+
+            count_before = len(svc_snap5.list_snapshots())
+
+            import_skip = svc_snap5.import_snapshot(snap5_zip, on_conflict="skip")
+            assert not import_skip.success
+            assert import_skip.action == "skip"
+
+            count_after = len(svc_snap5.list_snapshots())
+            assert count_after == count_before, "skip 不应增加快照数量"
+
+            audit_skip = svc_snap5.get_snapshot_audit_logs(action="snapshot_import", result="blocked")
+            skip_logs = [l for l in audit_skip if "跳过" in (l["error_message"] or "") or "skip" in (l["error_message"] or "").lower()]
+            assert len(skip_logs) >= 1, "skip 应记录审计日志"
+
+            r64.ok()
+            print(f"  [PASS] {r64.name}  (skip 策略生效)")
+        except Exception as e:
+            r64.fail(str(e))
+            print(f"  [FAIL] {r64.name}: {e}")
+
+        # ====== 测试 65: 源文件缺失时导入（不阻止但记录警告）
+        r65 = TestResult("测试65: 源文件缺失时导入不阻止，记录警告，replay 时需指定替代文件")
+        results.append(r65)
+        try:
+            svc_snap6 = PipelineService(db_path)
+
+            temp_csv = os.path.join(tmpdir, "temp_source.csv")
+            import shutil
+            shutil.copy(SAMPLE_CSV, temp_csv)
+
+            snap6_batch_id = svc_snap6.create_batch("snap_missing_src", temp_csv)
+            svc_snap6.process_batch(snap6_batch_id)
+
+            snap6_zip = os.path.join(tmpdir, "snap_missing.zip")
+            export6 = svc_snap6.export_snapshot("snap_missing_test", snap6_batch_id, output_path=snap6_zip)
+
+            os.remove(temp_csv)
+            assert not os.path.exists(temp_csv), "临时源文件应已删除"
+
+            import_missing = svc_snap6.import_snapshot(snap6_zip, on_conflict="rename", new_name="imported_missing_test")
+            assert import_missing.success
+
+            imported6 = svc_snap6.get_snapshot(import_missing.snapshot_id)
+            assert imported6 is not None
+            assert imported6["manifest"]["source"]["original_source_file"] == temp_csv
+
+            try:
+                svc_snap6.replay_snapshot(import_missing.snapshot_id)
+                assert False, "源文件缺失时 replay 应抛出异常"
+            except Exception as e:
+                assert "源文件不存在" in str(e) or "missing" in str(e).lower()
+
+            replay_ok = svc_snap6.replay_snapshot(
+                import_missing.snapshot_id, csv_path=SAMPLE_CSV, new_batch_name="replay_with_alt_csv")
+            assert replay_ok.success
+            assert replay_ok.new_batch_id > 0
+
+            r65.ok()
+            print(f"  [PASS] {r65.name}  (导入允许缺失源文件，replay 指定替代文件成功)")
+        except Exception as e:
+            r65.fail(str(e))
+            print(f"  [FAIL] {r65.name}: {e}")
+
+        # ====== 测试 66: 配置版本冲突导入（不阻止，使用快照配置）
+        r66 = TestResult("测试66: 配置版本不兼容时导入不阻止，使用快照中的配置")
+        results.append(r66)
+        try:
+            svc_snap7 = PipelineService(db_path)
+
+            snap7_batch_id = svc_snap7.create_batch("snap_cfg_src", SAMPLE_CSV)
+            svc_snap7.process_batch(snap7_batch_id)
+            svc_snap7.set_threshold(snap7_batch_id, zscore_threshold=1.0)
+            svc_snap7.process_batch(snap7_batch_id)
+
+            snap7_zip = os.path.join(tmpdir, "snap_cfg.zip")
+            svc_snap7.export_snapshot("snap_cfg_test", snap7_batch_id, output_path=snap7_zip)
+
+            new_db7 = os.path.join(tmpdir, "cfg_conflict.db")
+            svc_import7 = PipelineService(new_db7)
+
+            import7 = svc_import7.import_snapshot(snap7_zip)
+            assert import7.success
+
+            imported7 = svc_import7.get_snapshot(import7.snapshot_id)
+            assert imported7["config_version"] >= 2
+
+            manifest7 = imported7["manifest"]
+            assert manifest7["config"]["version"] >= 2
+            assert manifest7["config"]["config"]["anomaly_detection"]["zscore_threshold"] == 1.0
+
+            r66.ok()
+            print(f"  [PASS] {r66.name}  (config_version={imported7['config_version']})")
+        except Exception as e:
+            r66.fail(str(e))
+            print(f"  [FAIL] {r66.name}: {e}")
+
+        # ====== 测试 67: 快照 replay 成功，指标对比正确
+        r67 = TestResult("测试67: 快照 replay 成功，指标对比输出差异、失败原因、是否可接受")
+        results.append(r67)
+        try:
+            svc_snap8 = PipelineService(db_path)
+
+            snap8_batch_id = svc_snap8.create_batch("snap_replay_src", SAMPLE_CSV)
+            svc_snap8.process_batch(snap8_batch_id)
+
+            snap8_zip = os.path.join(tmpdir, "snap_replay.zip")
+            export8 = svc_snap8.export_snapshot("snap_replay_test", snap8_batch_id, output_path=snap8_zip)
+            snap8_id = export8["snapshot_id"]
+
+            replay8 = svc_snap8.replay_snapshot(
+                snap8_id, new_batch_name="replay_identical_data", csv_path=SAMPLE_CSV, tolerance_pct=1.0)
+            assert replay8.success
+            assert replay8.new_batch_id > 0
+            assert replay8.new_run_id > 0
+            assert replay8.snapshot_id == snap8_id
+
+            mc = replay8.metrics_comparison
+            assert mc["total_metrics_compared"] > 0
+            assert mc["tolerance_pct"] == 1.0
+
+            for d in replay8.differences:
+                assert "sensor" in d
+                assert "metric" in d
+                assert "original" in d
+                assert "new" in d
+                assert "within_tolerance" in d
+
+            assert isinstance(replay8.acceptable, bool)
+
+            audit_replay = svc_snap8.get_snapshot_audit_logs(action="snapshot_replay")
+            assert len(audit_replay) >= 1
+            assert audit_replay[0]["result"] == "success"
+            assert audit_replay[0]["snapshot_id"] == snap8_id
+            assert audit_replay[0]["batch_id"] == replay8.new_batch_id
+
+            r67.ok()
+            print(f"  [PASS] {r67.name}  (differences={len(replay8.differences)}, acceptable={replay8.acceptable})")
+        except Exception as e:
+            r67.fail(str(e))
+            print(f"  [FAIL] {r67.name}: {e}")
+
+        # ====== 测试 68: 快照 replay 差异容忍度验证
+        r68 = TestResult("测试68: replay 指标差异超出容忍度时标记为不可接受")
+        results.append(r68)
+        try:
+            svc_snap9 = PipelineService(db_path)
+
+            snap9_batch_id = svc_snap9.create_batch("snap_replay_diff", SAMPLE_CSV)
+            svc_snap9.process_batch(snap9_batch_id)
+
+            snap9_zip = os.path.join(tmpdir, "snap_replay_diff.zip")
+            export9 = svc_snap9.export_snapshot("snap_replay_diff_test", snap9_batch_id, output_path=snap9_zip)
+            snap9_id = export9["snapshot_id"]
+
+            modified_csv9 = os.path.join(tmpdir, "modified_for_replay.csv")
+            with open(SAMPLE_CSV, "r", encoding="utf-8") as f:
+                content9 = f.read()
+            modified_content9 = content9.replace("23.5", "9999.0")
+            with open(modified_csv9, "w", encoding="utf-8") as f:
+                f.write(modified_content9)
+
+            replay9 = svc_snap9.replay_snapshot(
+                snap9_id,
+                new_batch_name="replay_with_modified_data",
+                csv_path=modified_csv9,
+                tolerance_pct=0.01)
+            assert replay9.success
+
+            mc9 = replay9.metrics_comparison
+            assert mc9["metrics_out_of_tolerance"] > 0, "修改数据后应有指标超出容忍度"
+            assert replay9.acceptable is False, "超出容忍度时 acceptable 应为 False"
+            assert len(replay9.failures) > 0, "应有失败的指标列表"
+
+            for failure in replay9.failures:
+                assert "%" in failure or "tolerance" in failure.lower()
+
+            r68.ok()
+            print(f"  [PASS] {r68.name}  (out_of_tolerance={mc9['metrics_out_of_tolerance']}, failures={len(replay9.failures)})")
+        except Exception as e:
+            r68.fail(str(e))
+            print(f"  [FAIL] {r68.name}: {e}")
+
+        # ====== 测试 69: 快照审计日志查询
+        r69 = TestResult("测试69: 快照审计日志查询，可按操作类型和结果筛选")
+        results.append(r69)
+        try:
+            svc_snap10 = PipelineService(db_path)
+
+            all_audit = svc_snap10.get_snapshot_audit_logs()
+            assert len(all_audit) >= 1, "应有审计日志"
+
+            export_audit = svc_snap10.get_snapshot_audit_logs(action="snapshot_export")
+            assert len(export_audit) >= 1
+            for ea in export_audit:
+                assert ea["action"] == "snapshot_export"
+                assert ea["result"] == "success"
+
+            import_audit = svc_snap10.get_snapshot_audit_logs(action="snapshot_import")
+            assert len(import_audit) >= 1
+
+            replay_audit = svc_snap10.get_snapshot_audit_logs(action="snapshot_replay")
+            assert len(replay_audit) >= 1
+
+            success_audit = svc_snap10.get_snapshot_audit_logs(result="success")
+            assert len(success_audit) >= 1
+
+            blocked_audit = svc_snap10.get_snapshot_audit_logs(result="blocked")
+            assert len(blocked_audit) >= 1
+
+            for log in all_audit:
+                assert "id" in log
+                assert "created_at" in log
+                assert "action" in log
+                assert "result" in log
+                assert "snapshot_id" in log or "snapshot_name" in log
+
+            r69.ok()
+            print(f"  [PASS] {r69.name}  (export={len(export_audit)}, import={len(import_audit)}, replay={len(replay_audit)})")
+        except Exception as e:
+            r69.fail(str(e))
+            print(f"  [FAIL] {r69.name}: {e}")
+
+        # ====== 测试 70: CLI snapshot 命令帮助文本完整
+        r70 = TestResult("测试70: CLI snapshot 命令帮助文本完整")
+        results.append(r70)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+
+            runner = CliRunner()
+
+            res_snap_help = runner.invoke(cli, ["snapshot", "--help"])
+            assert res_snap_help.exit_code == 0
+            assert "export" in res_snap_help.output
+            assert "import" in res_snap_help.output
+            assert "list" in res_snap_help.output
+            assert "show" in res_snap_help.output
+            assert "replay" in res_snap_help.output
+            assert "delete" in res_snap_help.output
+            assert "audit-history" in res_snap_help.output
+
+            res_export_help = runner.invoke(cli, ["snapshot", "export", "--help"])
+            assert res_export_help.exit_code == 0
+            assert "NAME" in res_export_help.output or "name" in res_export_help.output
+            assert "BATCH_ID" in res_export_help.output or "batch_id" in res_export_help.output
+            assert "--run-id" in res_export_help.output
+            assert "--output" in res_export_help.output
+            assert "--type" in res_export_help.output
+
+            res_import_help = runner.invoke(cli, ["snapshot", "import", "--help"])
+            assert res_import_help.exit_code == 0
+            assert "FILE_PATH" in res_import_help.output or "file_path" in res_import_help.output
+            assert "--on-conflict" in res_import_help.output
+            assert "--new-name" in res_import_help.output
+            assert "reject" in res_import_help.output
+            assert "rename" in res_import_help.output
+            assert "skip" in res_import_help.output
+
+            res_replay_help = runner.invoke(cli, ["snapshot", "replay", "--help"])
+            assert res_replay_help.exit_code == 0
+            assert "SNAPSHOT_ID" in res_replay_help.output or "snapshot_id" in res_replay_help.output
+            assert "--new-batch-name" in res_replay_help.output
+            assert "--csv-path" in res_replay_help.output
+            assert "--tolerance" in res_replay_help.output
+
+            res_audit_help = runner.invoke(cli, ["snapshot", "audit-history", "--help"])
+            assert res_audit_help.exit_code == 0
+            assert "--action" in res_audit_help.output
+            assert "--result" in res_audit_help.output
+            assert "--limit" in res_audit_help.output
+
+            r70.ok()
+            print(f"  [PASS] {r70.name}")
+        except Exception as e:
+            r70.fail(str(e))
+            print(f"  [FAIL] {r70.name}: {e}")
+
+        # ====== 测试 71: CLI snapshot export/import/list/show/replay 输出对齐
+        r71 = TestResult("测试71: CLI snapshot 命令输出与文档对齐")
+        results.append(r71)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+
+            runner = CliRunner()
+            svc_cli_snap = PipelineService(db_path)
+
+            cli_snap_batch = svc_cli_snap.create_batch("cli_snap_test_batch", SAMPLE_CSV)
+            svc_cli_snap.process_batch(cli_snap_batch)
+
+            cli_snap_zip = os.path.join(tmpdir, "cli_snap.zip")
+            res_export = runner.invoke(cli, [
+                "--db", db_path, "snapshot", "export",
+                "cli_test_snapshot", str(cli_snap_batch),
+                "--output", cli_snap_zip
+            ])
+            assert res_export.exit_code == 0, f"export 应成功，exit={res_export.exit_code}, output={res_export.output}"
+            assert "[OK]" in res_export.output
+            assert "快照导出成功" in res_export.output
+            assert "快照ID" in res_export.output
+            assert "SHA256" in res_export.output
+            assert "配置版本" in res_export.output
+            assert "指标数量" in res_export.output
+
+            res_list = runner.invoke(cli, ["--db", db_path, "snapshot", "list"])
+            assert res_list.exit_code == 0
+            assert "ID" in res_list.output
+            assert "名称" in res_list.output
+            assert "cli_test_snapshot" in res_list.output
+
+            snap_id_for_show = None
+            for line in res_list.output.split("\n"):
+                if "cli_test_snapshot" in line:
+                    parts = line.split()
+                    if parts and parts[0].isdigit():
+                        snap_id_for_show = int(parts[0])
+                        break
+            assert snap_id_for_show is not None
+
+            res_show = runner.invoke(cli, ["--db", db_path, "snapshot", "show", str(snap_id_for_show)])
+            assert res_show.exit_code == 0
+            assert "快照 #" in res_show.output
+            assert "来源信息" in res_show.output
+            assert "处理摘要" in res_show.output
+            assert "依赖版本" in res_show.output
+            assert "校验和" in res_show.output
+            assert "源数据摘要" in res_show.output
+
+            res_replay = runner.invoke(cli, [
+                "--db", db_path, "snapshot", "replay",
+                str(snap_id_for_show),
+                "--new-batch-name", "cli_replay_test",
+                "--csv-path", SAMPLE_CSV,
+                "--tolerance", "1.0"
+            ])
+            assert res_replay.exit_code == 0, f"replay 应成功，exit={res_replay.exit_code}, output={res_replay.output}"
+            assert "[OK]" in res_replay.output
+            assert "快照重放完成" in res_replay.output
+            assert "新批次ID" in res_replay.output
+            assert "可接受" in res_replay.output
+            assert "指标对比" in res_replay.output
+
+            res_audit = runner.invoke(cli, [
+                "--db", db_path, "snapshot", "audit-history",
+                str(snap_id_for_show)
+            ])
+            assert res_audit.exit_code == 0
+            assert "ID" in res_audit.output
+            assert "操作" in res_audit.output
+            assert "导出" in res_audit.output or "导入" in res_audit.output or "重放" in res_audit.output
+
+            r71.ok()
+            print(f"  [PASS] {r71.name}  (export/list/show/replay/audit 全部对齐)")
+        except Exception as e:
+            r71.fail(str(e))
+            print(f"  [FAIL] {r71.name}: {e}")
+
         # ====== 汇总 ======
         print()
         total = len(results)

@@ -10,6 +10,7 @@ from .service import (
     SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult,
     SchemeDeriveResult, DryRunResult, DryRunRisk, SwitchSchemeResult
 )
+from . import snapshot as snap
 from .config import get_default_config, load_config
 
 OK = "[OK]"
@@ -1385,6 +1386,393 @@ def compare_delete(ctx, report_id):
         click.echo(f"{OK} 报告 {report_id} 已删除")
     except BatchServiceError as e:
         click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+
+
+# ========== 运行包快照 ==========
+
+@cli.group()
+def snapshot():
+    """运行包快照管理（导出/导入/重放可复现实验包）"""
+    pass
+
+
+@snapshot.command("export")
+@click.argument("name")
+@click.argument("batch_id", type=int)
+@click.option("--run-id", type=int, default=None, help="指定运行 ID（默认最新）")
+@click.option("--output", "-o", type=click.Path(), default=None, help="输出 ZIP 文件路径")
+@click.option("--type", "snapshot_type", type=click.Choice(["batch", "run"]), default="run",
+              help="快照类型: batch 或 run（默认 run）")
+@click.pass_context
+def snapshot_export(ctx, name, batch_id, run_id, output, snapshot_type):
+    """导出运行包快照为可复现实验包（ZIP）。
+
+    快照包含: 源 CSV 摘要、配置版本、指标结果、异常记录、
+    依赖版本、SHA256 校验摘要。可在另一数据库或重启后导入查看。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.export_snapshot(name, batch_id, run_id, output, snapshot_type)
+        click.echo(f"{OK} 快照导出成功")
+        click.echo(f"  快照ID:     {result['snapshot_id']}")
+        click.echo(f"  名称:       '{result['name']}'")
+        click.echo(f"  类型:       {snapshot_type}")
+        click.echo(f"  批次ID:     {batch_id}")
+        if run_id:
+            click.echo(f"  运行ID:     {run_id}")
+        click.echo(f"  输出文件:   {result['file_path']}")
+        click.echo(f"  文件大小:   {result['file_size']} bytes")
+        click.echo(f"  SHA256:     {result['checksum_sha256'][:32]}...")
+        mf = result['manifest']
+        click.echo(f"  配置版本:   v{mf['config']['version']}")
+        click.echo(f"  指标数量:   {mf['metrics_summary']['total_metrics']}")
+        click.echo(f"  异常数量:   {mf['anomalies_summary']['total_anomalies']}")
+        click.echo(f"  错误数量:   {mf['errors_summary']['total_errors']}")
+    except snap.SnapshotConflictError as e:
+        click.echo(f"{ERR} 快照冲突 ({e.conflict_type}): {e}", err=True)
+        click.echo(f"  详情: {e.details}", err=True)
+        sys.exit(1)
+    except snap.SnapshotError as e:
+        click.echo(f"{ERR} 快照错误: {e}", err=True)
+        sys.exit(1)
+    except BatchServiceError as e:
+        click.echo(f"{ERR} 批次错误: {e}", err=True)
+        sys.exit(1)
+
+
+@snapshot.command("import")
+@click.argument("file_path", type=click.Path(exists=True))
+@click.option("--on-conflict", type=click.Choice(["reject", "rename", "skip"]), default=None,
+              help="冲突处理策略: reject=拒绝, rename=自动重命名, skip=跳过")
+@click.option("--new-name", default=None, help="重命名时使用的新名称（仅 --on-conflict rename 时）")
+@click.pass_context
+def snapshot_import(ctx, file_path, on_conflict, new_name):
+    """从 ZIP 文件导入快照，支持冲突处理策略。
+
+    冲突场景: 同名快照、源文件缺失、配置版本不兼容。
+    所有导入决定写入审计日志，可通过 audit-history 查询。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.import_snapshot(file_path, on_conflict, new_name)
+        if result.success:
+            action_label = {
+                None: "导入",
+                "rename": "重命名导入"
+            }.get(result.action, "导入")
+            click.echo(f"{OK} {action_label}成功")
+            click.echo(f"  快照ID:     {result.snapshot_id}")
+            if result.original_name and result.original_name != result.final_name:
+                click.echo(f"  原始名称:   {result.original_name}")
+                click.echo(f"  落地名称:   {result.final_name}")
+            else:
+                click.echo(f"  名称:       '{result.final_name}'")
+            if result.original_batch_id:
+                click.echo(f"  原始批次ID: {result.original_batch_id}")
+            click.echo(f"  导入来源:   {result.imported_from}")
+            click.echo(f"  提示: 可使用 snapshot show {result.snapshot_id} 查看详情")
+        else:
+            action_label = {
+                "reject": "已拒绝导入",
+                "skip": "已跳过"
+            }.get(result.action, "操作")
+            click.echo(f"  {action_label}: {result.message}")
+            if result.original_name:
+                click.echo(f"  原始名称:   {result.original_name}")
+    except snap.SnapshotConflictError as e:
+        click.echo(f"{ERR} 导入冲突 ({e.conflict_type}): {e}", err=True)
+        click.echo(f"  详情: {e.details}", err=True)
+        click.echo("  提示: 使用 --on-conflict reject/rename/skip 自动处理", err=True)
+        sys.exit(1)
+    except snap.SnapshotError as e:
+        click.echo(f"{ERR} 快照错误: {e}", err=True)
+        sys.exit(1)
+
+
+@snapshot.command("list")
+@click.option("--batch-id", type=int, default=None, help="按批次 ID 筛选")
+@click.option("--status", type=click.Choice(["available", "deleted", "corrupted"]), default=None,
+              help="按状态筛选")
+@click.pass_context
+def snapshot_list(ctx, batch_id, status):
+    """列出快照，支持按批次和状态筛选。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    snapshots = svc.list_snapshots(batch_id, status)
+    if not snapshots:
+        click.echo("(暂无快照)")
+        return
+    rows = []
+    for s in snapshots:
+        status_label = {
+            "available": "可用",
+            "deleted": "已删除",
+            "corrupted": "已损坏"
+        }.get(s["status"], s["status"])
+        type_label = "批次" if s["snapshot_type"] == "batch" else "运行"
+        rows.append({
+            "ID": s["id"],
+            "名称": s["name"],
+            "类型": type_label,
+            "状态": status_label,
+            "配置版本": f"v{s['config_version']}",
+            "源批次": f"#{s['source_batch_id']}" if s.get("source_batch_id") else "-",
+            "源运行": f"#{s['source_run_id']}" if s.get("source_run_id") else "-",
+            "文件大小": s["file_size"],
+            "创建时间": s["created_at"][:19]
+        })
+    _print_table(rows)
+
+
+@snapshot.command("show")
+@click.argument("snapshot_id", type=int)
+@click.option("--manifest", is_flag=True, help="显示完整 manifest")
+@click.option("--metrics", is_flag=True, help="显示指标列表")
+@click.option("--source", is_flag=True, help="显示源数据摘要")
+@click.pass_context
+def snapshot_show(ctx, snapshot_id, manifest, metrics, source):
+    """显示快照详情。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    s = svc.get_snapshot(snapshot_id)
+    if not s:
+        click.echo(f"{ERR} 快照不存在: {snapshot_id}", err=True)
+        sys.exit(1)
+
+    mf = s["manifest"]
+    status_label = {
+        "available": "可用",
+        "deleted": "已删除",
+        "corrupted": "已损坏"
+    }.get(s["status"], s["status"])
+    type_label = "批次" if s["snapshot_type"] == "batch" else "运行"
+
+    click.echo(f"=== 快照 #{s['id']} ===")
+    click.echo(f"  名称:       {s['name']}")
+    click.echo(f"  类型:       {type_label}")
+    click.echo(f"  状态:       {status_label}")
+    click.echo(f"  配置版本:   v{s['config_version']}")
+    click.echo(f"  文件路径:   {s['file_path']}")
+    click.echo(f"  文件大小:   {s['file_size']} bytes")
+    click.echo(f"  SHA256:     {s['checksum_sha256'][:32]}...")
+    click.echo(f"  创建时间:   {s['created_at']}")
+
+    if s.get("imported_from"):
+        click.echo(f"  导入来源:   {s['imported_from']}")
+    if s.get("original_batch_id"):
+        click.echo(f"  原始批次ID: {s['original_batch_id']}")
+    if s.get("original_run_id"):
+        click.echo(f"  原始运行ID: {s['original_run_id']}")
+
+    src = mf.get("source", {})
+    click.echo(f"\n--- 来源信息 ---")
+    click.echo(f"  原始批次:   #{src.get('original_batch_id')} '{src.get('original_batch_name')}'")
+    click.echo(f"  原始运行:   #{src.get('original_run_id')} (第 {src.get('original_run_number')} 次)")
+    click.echo(f"  源文件:     {src.get('original_source_file')}")
+    click.echo(f"  原始创建:   {src.get('original_created_at')}")
+    click.echo(f"  原始处理:   {src.get('original_processed_at')}")
+
+    ms = mf.get("metrics_summary", {})
+    click.echo(f"\n--- 处理摘要 ---")
+    click.echo(f"  处理行数:   {ms.get('rows_processed', 0)}")
+    click.echo(f"  错误行数:   {ms.get('rows_errors', 0)}")
+    click.echo(f"  指标数量:   {ms.get('total_metrics', 0)}")
+    click.echo(f"  异常数量:   {mf.get('anomalies_summary', {}).get('total_anomalies', 0)}")
+
+    atc = mf.get("anomalies_summary", {}).get("anomaly_type_counts", {})
+    if atc:
+        click.echo(f"  异常类型:   {', '.join([f'{k}={v}' for k, v in atc.items()])}")
+
+    dep = mf.get("dependencies", {})
+    click.echo(f"\n--- 依赖版本 ---")
+    for pkg, ver in dep.items():
+        click.echo(f"  {pkg:15s}: {ver}")
+
+    show_all = not (manifest or metrics or source)
+
+    if show_all or manifest:
+        click.echo(f"\n--- 校验和 ---")
+        for k, v in mf.get("checksums", {}).items():
+            click.echo(f"  {k:15s}: {v[:32]}...")
+
+    if show_all or metrics:
+        click.echo(f"\n--- 指标（前10项）---")
+        m_list = ms.get("metrics", [])
+        if m_list:
+            rows = [{"传感器": m["sensor_name"], "指标": m["metric_name"],
+                     "值": round(m["metric_value"], 6)} for m in m_list[:10]]
+            _print_table(rows)
+            if len(m_list) > 10:
+                click.echo(f"  ... 共 {len(m_list)} 项指标")
+        else:
+            click.echo("(无)")
+
+    if show_all or source:
+        ss = mf.get("source_summary", {})
+        click.echo(f"\n--- 源数据摘要 ---")
+        click.echo(f"  文件名:     {ss.get('file_name')}")
+        click.echo(f"  总行数:     {ss.get('total_rows', 0)}")
+        click.echo(f"  列名:       {', '.join(ss.get('columns', []))}")
+        if ss.get("time_range", {}).get("start"):
+            click.echo(f"  时间范围:   {ss['time_range']['start']} 至 {ss['time_range']['end']}")
+        cs = ss.get("column_statistics", {})
+        if cs:
+            click.echo(f"\n  列统计（前5列）:")
+            for col, stats in list(cs.items())[:5]:
+                click.echo(f"    {col}: mean={stats['mean']:.4f}, std={stats['std']:.4f}, "
+                           f"min={stats['min']:.4f}, max={stats['max']:.4f}")
+
+
+@snapshot.command("replay")
+@click.argument("snapshot_id", type=int)
+@click.option("--new-batch-name", default=None, help="新批次名称（默认自动生成）")
+@click.option("--csv-path", type=click.Path(exists=True), default=None,
+              help="新的 CSV 源文件路径（默认使用快照中的源文件）")
+@click.option("--tolerance", type=float, default=1.0, help="指标差异容忍百分比（默认 1%）")
+@click.pass_context
+def snapshot_replay(ctx, snapshot_id, new_batch_name, csv_path, tolerance):
+    """用快照中的配置和样本重新跑一遍，对比原指标并标出差异。
+
+    输出: 对比指标差异（绝对差、相对差%）、失败原因、是否可接受。
+    差异超出容忍度的指标会明确标出。所有操作写入审计日志。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.replay_snapshot(snapshot_id, new_batch_name, csv_path, tolerance)
+        if result.success:
+            click.echo(f"{OK} 快照重放完成")
+            click.echo(f"  快照ID:     {result.snapshot_id}")
+            click.echo(f"  新批次ID:   {result.new_batch_id}")
+            click.echo(f"  新运行ID:   {result.new_run_id}")
+            click.echo(f"  容忍度:     {tolerance}%")
+            click.echo(f"  可接受:     {'是' if result.acceptable else '否'}")
+
+            mc = result.metrics_comparison
+            click.echo(f"\n--- 指标对比 ---")
+            click.echo(f"  总对比数:   {mc.get('total_metrics_compared', 0)}")
+            click.echo(f"  有差异:     {mc.get('metrics_with_diff', 0)}")
+            click.echo(f"  超容忍:     {mc.get('metrics_out_of_tolerance', 0)}")
+
+            if result.differences:
+                click.echo(f"\n--- 差异详情（前20项）---")
+                rows = []
+                for d in result.differences[:20]:
+                    status = "OK" if d.get("within_tolerance", True) else "FAIL"
+                    abs_diff = d.get("abs_diff")
+                    rel_diff = d.get("rel_diff_pct")
+                    rows.append({
+                        "状态": status,
+                        "传感器": d.get("sensor"),
+                        "指标": d.get("metric"),
+                        "原值": round(d.get("original"), 6) if d.get("original") is not None else "-",
+                        "新值": round(d.get("new"), 6) if d.get("new") is not None else "-",
+                        "绝对差": round(abs_diff, 6) if abs_diff is not None else "-",
+                        "相对差%": round(rel_diff, 2) if rel_diff is not None and rel_diff != float("inf") else "inf"
+                    })
+                _print_table(rows)
+                if len(result.differences) > 20:
+                    click.echo(f"  ... 共 {len(result.differences)} 项差异")
+
+            if result.failures:
+                click.echo(f"\n--- 超出容忍度的指标 ---")
+                for i, f in enumerate(result.failures, 1):
+                    click.echo(f"  {i}. {f}")
+
+            if result.message:
+                click.echo(f"\n  提示: {result.message}")
+        else:
+            click.echo(f"{ERR} 重放失败: {result.message}", err=True)
+            if result.failures:
+                for f in result.failures:
+                    click.echo(f"  原因: {f}", err=True)
+            sys.exit(1)
+    except snap.SnapshotConflictError as e:
+        click.echo(f"{ERR} 重放冲突 ({e.conflict_type}): {e}", err=True)
+        click.echo(f"  详情: {e.details}", err=True)
+        sys.exit(1)
+    except snap.SnapshotNotFoundError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+    except snap.SnapshotError as e:
+        click.echo(f"{ERR} 快照错误: {e}", err=True)
+        sys.exit(1)
+
+
+@snapshot.command("delete")
+@click.argument("snapshot_id", type=int)
+@click.pass_context
+def snapshot_delete(ctx, snapshot_id):
+    """删除快照（软删除，保留历史记录）。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        svc.delete_snapshot(snapshot_id)
+        click.echo(f"{OK} 快照 {snapshot_id} 已删除（软删除）")
+    except snap.SnapshotNotFoundError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+    except snap.SnapshotError as e:
+        click.echo(f"{ERR} 快照错误: {e}", err=True)
+        sys.exit(1)
+
+
+@snapshot.command("audit-history")
+@click.argument("snapshot_id", type=int, required=False)
+@click.option("--action", type=click.Choice(["snapshot_export", "snapshot_import", "snapshot_replay"]),
+              default=None, help="按操作类型筛选")
+@click.option("--result", type=click.Choice(["success", "failed", "blocked"]), default=None,
+              help="按结果筛选")
+@click.option("--limit", type=int, default=50, help="最多显示条数（默认 50）")
+@click.pass_context
+def snapshot_audit_history(ctx, snapshot_id, action, result, limit):
+    """查看快照审计历史（导出/导入/重放/删除）。
+
+    所有操作决定均记录在此，重启后仍可查询。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        from . import database as db
+        conn = svc._conn()
+        try:
+            logs = db.get_snapshot_audit_logs(
+                conn,
+                snapshot_id=snapshot_id,
+                action=action,
+                result=result,
+                limit=limit
+            )
+        finally:
+            conn.close()
+
+        if not logs:
+            click.echo("(暂无审计记录)")
+            return
+
+        action_labels = {
+            "snapshot_export": "导出",
+            "snapshot_import": "导入",
+            "snapshot_replay": "重放"
+        }
+        result_labels = {
+            "success": "成功",
+            "failed": "失败",
+            "blocked": "阻止"
+        }
+
+        rows = []
+        for log in logs:
+            snap_info = f"#{log['snapshot_id']}" if log.get("snapshot_id") else "-"
+            batch_info = f"#{log['batch_id']}" if log.get("batch_id") else "-"
+            run_info = f"#{log['run_id']}" if log.get("run_id") else "-"
+
+            rows.append({
+                "ID": log["id"],
+                "时间": log["created_at"][:19],
+                "操作": action_labels.get(log["action"], log["action"]),
+                "快照": snap_info,
+                "批次": batch_info,
+                "运行": run_info,
+                "结果": result_labels.get(log["result"], log["result"]),
+                "错误": log.get("error_message") or ""
+            })
+
+        _print_table(rows)
+    except Exception as e:
+        click.echo(f"{ERR} 查询失败: {e}", err=True)
         sys.exit(1)
 
 

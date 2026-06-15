@@ -152,6 +152,8 @@ def init_db(db_path: str = None) -> None:
                 scheme_id INTEGER,
                 scheme_name TEXT,
                 source_scheme_id INTEGER,
+                snapshot_id INTEGER,
+                snapshot_name TEXT,
                 action TEXT NOT NULL,
                 trigger_method TEXT NOT NULL,
                 previous_config_json TEXT,
@@ -167,6 +169,34 @@ def init_db(db_path: str = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_scheme_id ON scheme_audit_log(scheme_id);
             CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_action ON scheme_audit_log(action);
             CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_result ON scheme_audit_log(result);
+
+            CREATE TABLE IF NOT EXISTS run_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                snapshot_type TEXT NOT NULL,
+                source_batch_id INTEGER,
+                source_run_id INTEGER,
+                source_batch_name TEXT,
+                source_run_number INTEGER,
+                config_version INTEGER NOT NULL,
+                manifest_json TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                checksum_sha256 TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'available',
+                original_batch_id INTEGER,
+                original_run_id INTEGER,
+                imported_from TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (source_batch_id) REFERENCES batches(id) ON DELETE SET NULL,
+                FOREIGN KEY (source_run_id) REFERENCES runs(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_run_snapshots_name ON run_snapshots(name);
+            CREATE INDEX IF NOT EXISTS idx_run_snapshots_batch_id ON run_snapshots(source_batch_id);
+            CREATE INDEX IF NOT EXISTS idx_run_snapshots_run_id ON run_snapshots(source_run_id);
+            CREATE INDEX IF NOT EXISTS idx_run_snapshots_status ON run_snapshots(status);
         """)
         conn.commit()
 
@@ -192,6 +222,12 @@ def init_db(db_path: str = None) -> None:
 
         cursor.execute("PRAGMA table_info(scheme_audit_log)")
         sal_cols = {col[1]: col[3] for col in cursor.fetchall()}
+        if "snapshot_id" not in sal_cols:
+            cursor.execute("ALTER TABLE scheme_audit_log ADD COLUMN snapshot_id INTEGER")
+            conn.commit()
+        if "snapshot_name" not in sal_cols:
+            cursor.execute("ALTER TABLE scheme_audit_log ADD COLUMN snapshot_name TEXT")
+            conn.commit()
         if sal_cols.get("batch_id") == 1:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS scheme_audit_log_new (
@@ -200,6 +236,8 @@ def init_db(db_path: str = None) -> None:
                     scheme_id INTEGER,
                     scheme_name TEXT,
                     source_scheme_id INTEGER,
+                    snapshot_id INTEGER,
+                    snapshot_name TEXT,
                     action TEXT NOT NULL,
                     trigger_method TEXT NOT NULL,
                     previous_config_json TEXT,
@@ -762,6 +800,9 @@ AUDIT_ACTION_IMPORT_APPLY = "import_apply"
 AUDIT_ACTION_ROLLBACK = "rollback"
 AUDIT_ACTION_DIRECT_MODIFY = "direct_modify"
 AUDIT_ACTION_DRY_RUN = "dry_run"
+AUDIT_ACTION_SNAPSHOT_EXPORT = "snapshot_export"
+AUDIT_ACTION_SNAPSHOT_IMPORT = "snapshot_import"
+AUDIT_ACTION_SNAPSHOT_REPLAY = "snapshot_replay"
 
 AUDIT_RESULT_SUCCESS = "success"
 AUDIT_RESULT_FAILED = "failed"
@@ -781,6 +822,8 @@ def add_scheme_audit_log(
     scheme_id: int = None,
     scheme_name: str = None,
     source_scheme_id: int = None,
+    snapshot_id: int = None,
+    snapshot_name: str = None,
     previous_config: Dict[str, Any] = None,
     new_config: Dict[str, Any] = None,
     config_diff: Dict[str, Any] = None,
@@ -808,12 +851,14 @@ def add_scheme_audit_log(
     cursor.execute("""
         INSERT INTO scheme_audit_log (
             batch_id, scheme_id, scheme_name, source_scheme_id,
+            snapshot_id, snapshot_name,
             action, trigger_method,
             previous_config_json, new_config_json, config_diff_json,
             result, error_message, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         batch_id, scheme_id, scheme_name, source_scheme_id,
+        snapshot_id, snapshot_name,
         action, trigger_method,
         json.dumps(previous_config, ensure_ascii=False) if previous_config else None,
         json.dumps(new_config, ensure_ascii=False) if new_config else None,
@@ -939,3 +984,198 @@ def compute_config_diff(previous_config: Dict[str, Any], new_config: Dict[str, A
         }
 
     return diff
+
+
+# ============ Run Snapshot Operations ============
+
+SNAPSHOT_STATUS_AVAILABLE = "available"
+SNAPSHOT_STATUS_DELETED = "deleted"
+SNAPSHOT_STATUS_CORRUPTED = "corrupted"
+
+SNAPSHOT_TYPE_BATCH = "batch"
+SNAPSHOT_TYPE_RUN = "run"
+
+SNAPSHOT_FORMAT_VERSION = "1.0"
+
+
+def create_snapshot(conn: sqlite3.Connection, name: str, snapshot_type: str,
+                    source_batch_id: int, source_run_id: int,
+                    source_batch_name: str, source_run_number: int,
+                    config_version: int, manifest: Dict[str, Any],
+                    file_path: str, file_size: int, checksum_sha256: str,
+                    original_batch_id: int = None, original_run_id: int = None,
+                    imported_from: str = None) -> int:
+    """创建快照记录，返回快照 ID"""
+    now = datetime.now().isoformat()
+    manifest_json = json.dumps(manifest, ensure_ascii=False)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO run_snapshots (
+            name, snapshot_type, source_batch_id, source_run_id,
+            source_batch_name, source_run_number, config_version,
+            manifest_json, file_path, file_size, checksum_sha256,
+            status, original_batch_id, original_run_id, imported_from,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        name, snapshot_type, source_batch_id, source_run_id,
+        source_batch_name, source_run_number, config_version,
+        manifest_json, file_path, file_size, checksum_sha256,
+        SNAPSHOT_STATUS_AVAILABLE, original_batch_id, original_run_id, imported_from,
+        now, now
+    ))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_snapshot(conn: sqlite3.Connection, snapshot_id: int) -> Optional[Dict[str, Any]]:
+    """按 ID 获取快照"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM run_snapshots WHERE id = ?", (snapshot_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["manifest"] = json.loads(result["manifest_json"])
+    del result["manifest_json"]
+    return result
+
+
+def get_snapshot_by_name(conn: sqlite3.Connection, name: str) -> Optional[Dict[str, Any]]:
+    """按名称获取快照"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM run_snapshots WHERE name = ?", (name,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["manifest"] = json.loads(result["manifest_json"])
+    del result["manifest_json"]
+    return result
+
+
+def list_snapshots(conn: sqlite3.Connection, batch_id: int = None,
+                   status: str = None) -> List[Dict[str, Any]]:
+    """列出快照，可按批次和状态筛选"""
+    cursor = conn.cursor()
+    query = "SELECT id, name, snapshot_type, source_batch_id, source_run_id, source_batch_name, source_run_number, config_version, file_size, status, original_batch_id, original_run_id, imported_from, created_at, updated_at FROM run_snapshots WHERE 1=1"
+    params = []
+    if batch_id is not None:
+        query += " AND source_batch_id = ?"
+        params.append(batch_id)
+    if status is not None:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY id DESC"
+    cursor.execute(query, params)
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def update_snapshot_status(conn: sqlite3.Connection, snapshot_id: int, status: str) -> None:
+    """更新快照状态"""
+    now = datetime.now().isoformat()
+    conn.execute("""
+        UPDATE run_snapshots SET status = ?, updated_at = ? WHERE id = ?
+    """, (status, now, snapshot_id))
+    conn.commit()
+
+
+def update_snapshot_name(conn: sqlite3.Connection, snapshot_id: int, new_name: str) -> None:
+    """更新快照名称（用于导入重命名）"""
+    now = datetime.now().isoformat()
+    conn.execute("""
+        UPDATE run_snapshots SET name = ?, updated_at = ? WHERE id = ?
+    """, (new_name, now, snapshot_id))
+    conn.commit()
+
+
+def delete_snapshot(conn: sqlite3.Connection, snapshot_id: int) -> None:
+    """删除快照（软删除，标记状态）"""
+    update_snapshot_status(conn, snapshot_id, SNAPSHOT_STATUS_DELETED)
+
+
+def get_snapshot_manifest(conn: sqlite3.Connection, snapshot_id: int) -> Optional[Dict[str, Any]]:
+    """仅获取快照的 manifest 内容"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT manifest_json FROM run_snapshots WHERE id = ?", (snapshot_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return json.loads(row["manifest_json"])
+
+
+# ============ Snapshot Audit Log Helpers ============
+
+def add_snapshot_audit_log(conn: sqlite3.Connection, action: str,
+                           snapshot_id: int = None, snapshot_name: str = None,
+                           batch_id: int = None, run_id: int = None,
+                           result: str = AUDIT_RESULT_SUCCESS,
+                           trigger_method: str = AUDIT_TRIGGER_CLI,
+                           previous_config: Dict[str, Any] = None,
+                           new_config: Dict[str, Any] = None,
+                           config_diff: Dict[str, Any] = None,
+                           error_message: str = None,
+                           details: Dict[str, Any] = None) -> int:
+    """添加快照相关审计日志的便捷函数"""
+    full_details = details or {}
+    if snapshot_id:
+        full_details["snapshot_id"] = snapshot_id
+    if snapshot_name:
+        full_details["snapshot_name"] = snapshot_name
+    if run_id:
+        full_details["run_id"] = run_id
+
+    return add_scheme_audit_log(
+        conn,
+        batch_id=batch_id,
+        action=action,
+        trigger_method=trigger_method,
+        result=result,
+        snapshot_id=snapshot_id,
+        snapshot_name=snapshot_name,
+        previous_config=previous_config,
+        new_config=new_config,
+        config_diff=config_diff,
+        error_message=error_message
+    )
+
+
+def get_snapshot_audit_logs(conn: sqlite3.Connection, snapshot_id: int = None,
+                            action: str = None, result: str = None,
+                            limit: int = 100) -> List[Dict[str, Any]]:
+    """查询快照审计日志，支持按快照、操作类型、结果筛选"""
+    cursor = conn.cursor()
+    query = "SELECT * FROM scheme_audit_log WHERE 1=1"
+    params = []
+    if snapshot_id is not None:
+        query += " AND snapshot_id = ?"
+        params.append(snapshot_id)
+    if action is not None:
+        query += " AND action = ?"
+        params.append(action)
+    if result is not None:
+        query += " AND result = ?"
+        params.append(result)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, params)
+    results = []
+    for row in cursor.fetchall():
+        r = dict(row)
+        if r.get("previous_config_json"):
+            r["previous_config"] = json.loads(r["previous_config_json"])
+            del r["previous_config_json"]
+        else:
+            r.pop("previous_config_json", None)
+        if r.get("new_config_json"):
+            r["new_config"] = json.loads(r["new_config_json"])
+            del r["new_config_json"]
+        else:
+            r.pop("new_config_json", None)
+        if r.get("config_diff_json"):
+            r["config_diff"] = json.loads(r["config_diff_json"])
+            del r["config_diff_json"]
+        else:
+            r.pop("config_diff_json", None)
+        results.append(r)
+    return results

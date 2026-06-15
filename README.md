@@ -52,6 +52,27 @@ python -m pipeline compare export 1 -o exports/ --format csv
 ### 对比报告 (Comparison Report)
 对多个已处理批次的关键指标、异常数量、配置版本和数据来源进行汇总对比。报告与参与批次解耦，锁定批次可以安全参与对比而不会被修改。
 
+### 运行包快照 (Run Snapshot)
+将处理完成的实验批次打包成可复现实验包，包含完整的源数据摘要、配置版本、指标结果、异常记录、依赖版本和校验信息。快照可以在另一份数据库或重启后导入查看，并支持用快照中的配置和样本重新运行（replay）进行结果对比。
+
+**快照包内容（ZIP 压缩）：**
+- `manifest.json`: 快照元数据，包含来源信息、配置摘要、指标摘要、异常摘要、错误摘要、依赖版本和校验和
+- `config.json`: 完整的运行配置
+- `metrics.json`: 所有指标结果
+- `anomalies.json`: 异常检测结果
+- `errors.json`: 行级错误记录
+- `source_summary.json`: 源 CSV 摘要（文件哈希、样本数据、列统计、时间范围）
+- `dependencies.json`: 依赖版本信息
+- `checksum.json`: 所有文件的 SHA256 校验和
+
+**冲突处理策略：**
+- `reject`（默认）: 检测到同名快照时报错拒绝
+- `rename`: 自动重命名（添加时间戳后缀或指定 `--new-name`）
+- `skip`: 跳过冲突快照
+
+**审计日志：**
+所有快照操作（导出/导入/重放/删除）均写入审计日志，包含操作类型、快照信息、结果状态和错误原因。
+
 ## CLI 命令
 
 ### 基础命令
@@ -253,3 +274,10 @@ python samples/regression_test.py
 - **switch 命令流水完整**：apply/clone/derive/rollback 四种模式均走预检→确认→执行
 - **回滚前后结果变化**：配置版本、当前方案、配置值在回滚后正确回到上一版本
 - **rollback dry-run 拦截生效**：锁定批次、无历史、最早版本三种场景预检阻止
+- **导入冲突追溯完整**：rename/overwrite/skip 三种冲突策略均填充 original_name、final_name、original_id、imported_from；import 审计日志记录完整
+- **导入后跨重启查询**：导入方案、审计日志、original_id 在重启后持久化并可查
+- **import-apply 一步链路**：导入修改后 JSON → 立即应用 → 审计日志记录 import_apply 动作及配置差异
+- **导入应用后回滚再处理**：回滚后阈值恢复、继续处理正常、审计包含 import_apply 和 rollback 记录
+- **last-change 快速查看**：no_change/apply/threshold/rollback 各状态正确返回，跨重启持久化
+- **CLI import-apply 和 last-change 命令**：帮助文本正常、执行输出包含追溯字段、last-change 显示 import_apply 动作
+- **导入应用→切换回滚→继续处理→审计连续**：import-apply 后可回滚，last-change 显示回滚结果，审计历史完整

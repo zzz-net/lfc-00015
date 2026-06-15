@@ -819,6 +819,19 @@ class PipelineService:
         finally:
             conn.close()
 
+    def get_snapshot_audit_logs(self, snapshot_id: int = None,
+                               action: str = None, result: str = None,
+                               limit: int = 100) -> List[Dict[str, Any]]:
+        """查询快照审计日志，支持按快照、操作类型、结果筛选"""
+        conn = self._conn()
+        try:
+            return db.get_snapshot_audit_logs(
+                conn, snapshot_id=snapshot_id,
+                action=action, result=result, limit=limit
+            )
+        finally:
+            conn.close()
+
     def get_scheme_by_original_id(self, original_id: int) -> Optional[Dict[str, Any]]:
         """通过原始方案 ID 查找导入的方案（用于导入导出后的历史连续性）"""
         conn = self._conn()
@@ -2327,5 +2340,121 @@ class PipelineService:
                 "rollback_info": rollback_info,
                 "message": None
             }
+        finally:
+            conn.close()
+
+    # ========== 运行包快照 ==========
+
+    def export_snapshot(self, name: str, batch_id: int, run_id: int = None,
+                        output_path: str = None,
+                        snapshot_type: str = db.SNAPSHOT_TYPE_RUN) -> Dict[str, Any]:
+        """
+        导出运行包快照。
+
+        Args:
+            name: 快照名称
+            batch_id: 批次 ID
+            run_id: 运行 ID（None 时使用最新 run）
+            output_path: 输出 ZIP 文件路径
+            snapshot_type: 快照类型（batch/run）
+
+        Returns:
+            包含 snapshot_id, file_path, checksum 等信息的 dict
+        """
+        from . import snapshot as snap
+        conn = self._conn()
+        try:
+            return snap.export_snapshot(
+                conn, name, batch_id, run_id, output_path, snapshot_type
+            )
+        finally:
+            conn.close()
+
+    def import_snapshot(self, file_path: str,
+                        on_conflict: str = None,
+                        new_name: str = None) -> "snap.SnapshotImportResult":
+        """
+        从 ZIP 文件导入快照。
+
+        Args:
+            file_path: 快照 ZIP 文件路径
+            on_conflict: 冲突处理策略 (reject/rename/skip)
+            new_name: 重命名时使用的新名称
+
+        Returns:
+            SnapshotImportResult
+        """
+        from . import snapshot as snap
+        conn = self._conn()
+        try:
+            return snap.import_snapshot(conn, file_path, on_conflict, new_name)
+        finally:
+            conn.close()
+
+    def replay_snapshot(self, snapshot_id: int, new_batch_name: str = None,
+                        csv_path: str = None,
+                        tolerance_pct: float = 1.0) -> "snap.SnapshotReplayResult":
+        """
+        使用快照中的配置和样本重新运行实验，对比原指标。
+
+        Args:
+            snapshot_id: 快照 ID
+            new_batch_name: 新批次名称（默认自动生成）
+            csv_path: 新的 CSV 源文件路径（默认使用快照中的源文件）
+            tolerance_pct: 指标差异容忍百分比（默认 1%）
+
+        Returns:
+            SnapshotReplayResult
+        """
+        from . import snapshot as snap
+        conn = self._conn()
+        try:
+            return snap.replay_snapshot(
+                conn, snapshot_id, new_batch_name, csv_path, tolerance_pct
+            )
+        finally:
+            conn.close()
+
+    def get_snapshot(self, snapshot_id: int) -> Optional[Dict[str, Any]]:
+        """获取快照详情"""
+        conn = self._conn()
+        try:
+            return db.get_snapshot(conn, snapshot_id)
+        finally:
+            conn.close()
+
+    def get_snapshot_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """按名称获取快照"""
+        conn = self._conn()
+        try:
+            return db.get_snapshot_by_name(conn, name)
+        finally:
+            conn.close()
+
+    def list_snapshots(self, batch_id: int = None, status: str = None) -> List[Dict[str, Any]]:
+        """列出快照，可按批次和状态筛选"""
+        conn = self._conn()
+        try:
+            return db.list_snapshots(conn, batch_id, status)
+        finally:
+            conn.close()
+
+    def delete_snapshot(self, snapshot_id: int) -> None:
+        """删除快照（软删除）"""
+        conn = self._conn()
+        try:
+            snapshot = db.get_snapshot(conn, snapshot_id)
+            if not snapshot:
+                raise snap.SnapshotNotFoundError(f"快照不存在: {snapshot_id}")
+            db.delete_snapshot(conn, snapshot_id)
+            db.add_snapshot_audit_log(
+                conn,
+                action=db.AUDIT_ACTION_SNAPSHOT_EXPORT,
+                snapshot_id=snapshot_id,
+                snapshot_name=snapshot["name"],
+                result=db.AUDIT_RESULT_SUCCESS,
+                details={"action": "delete"}
+            )
+            logger.info(f"快照已删除: id={snapshot_id}, name='{snapshot['name']}'")
         finally:
             conn.close()
