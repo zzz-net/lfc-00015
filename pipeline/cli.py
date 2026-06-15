@@ -1776,6 +1776,383 @@ def snapshot_audit_history(ctx, snapshot_id, action, result, limit):
         sys.exit(1)
 
 
+# ============ 基线批次库管理 ============
+
+@cli.group()
+def baseline():
+    """基线批次库管理（注册/复核/导入/导出/历史追溯）。
+
+    把已处理完成的批次登记为可复用基线，后续新批次可直接做漂移复核，
+    输出通过/警告/阻断三级结论，明确列出超阈值指标、差异百分比和建议动作。"""
+    pass
+
+
+@baseline.command("register")
+@click.argument("name")
+@click.argument("batch_id", type=int)
+@click.option("--run-id", type=int, default=None, help="指定运行 ID（默认使用批次最新 run）")
+@click.option("--description", default=None, help="基线备注说明")
+@click.option("--warn-pct", type=float, default=5.0, show_default=True, help="警告阈值（差异百分比）")
+@click.option("--block-pct", type=float, default=15.0, show_default=True, help="阻断阈值（差异百分比）")
+@click.pass_context
+def baseline_register(ctx, name, batch_id, run_id, description, warn_pct, block_pct):
+    """从已处理完成的批次注册基线。
+
+    注册时会根据批次指标值自动生成 warn/block 两级阈值，
+    后续复核时按此阈值判定通过/警告/阻断。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.register_baseline(
+            name, batch_id, run_id=run_id,
+            description=description, warn_pct=warn_pct, block_pct=block_pct
+        )
+        click.echo(f"{OK} 基线已注册")
+        click.echo(f"  基线ID:     {result['baseline_id']}")
+        click.echo(f"  基线名称:   {result['name']}")
+        click.echo(f"  批次ID:     {result['source_batch_id']}")
+        click.echo(f"  运行ID:     {result['source_run_id']}")
+        click.echo(f"  配置版本:   v{result['config_version']}")
+        click.echo(f"  指标数量:   {result['metrics_count']}")
+        click.echo(f"  警告阈值:   ±{warn_pct}%")
+        click.echo(f"  阻断阈值:   ±{block_pct}%")
+    except Exception as e:
+        click.echo(f"{ERR} 注册失败: {e}", err=True)
+        sys.exit(1)
+
+
+@baseline.command("check")
+@click.argument("baseline_id", type=int)
+@click.argument("batch_id", type=int)
+@click.option("--run-id", type=int, default=None, help="指定目标运行 ID（默认使用批次最新 run）")
+@click.pass_context
+def baseline_check(ctx, baseline_id, batch_id, run_id):
+    """用基线复核目标批次的指标漂移情况。
+
+    输出三级结论：pass（通过）/ warn（警告）/ block（阻断），
+    明确列出超阈值指标、差异百分比和建议动作。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.check_baseline(baseline_id, batch_id, run_id=run_id)
+
+        status_labels = {
+            "pass": "通过",
+            "warn": "警告",
+            "block": "阻断"
+        }
+        status_symbols = {
+            "pass": OK,
+            "warn": "! ",
+            "block": "X "
+        }
+
+        click.echo(f"{status_symbols.get(result.overall_status, '  ')} 基线复核完成")
+        click.echo(f"  基线ID:     {result.baseline_id}")
+        click.echo(f"  基线名称:   {result.baseline_name}")
+        click.echo(f"  目标批次:   #{result.target_batch_id}")
+        click.echo(f"  目标运行:   #{result.target_run_id}")
+        click.echo(f"  总体结论:   {status_labels.get(result.overall_status, result.overall_status)}")
+        click.echo(f"  指标总计:   {result.total_metrics}")
+        click.echo(f"  通过:       {result.pass_count}")
+        click.echo(f"  警告:       {result.warn_count}")
+        click.echo(f"  阻断:       {result.block_count}")
+        click.echo()
+
+        if result.metric_results:
+            rows = []
+            for mr in result.metric_results:
+                label = status_labels.get(mr.status, mr.status)
+                rows.append({
+                    "指标": mr.metric_name,
+                    "基线值": f"{mr.baseline_value:.4f}",
+                    "实际值": f"{mr.actual_value:.4f}",
+                    "绝对差": f"{mr.absolute_diff:+.4f}",
+                    "相对差": f"{mr.relative_pct:+.2f}%",
+                    "警告阈": f"±{mr.warn_threshold_pct}%",
+                    "阻断阈": f"±{mr.block_threshold_pct}%",
+                    "状态": label
+                })
+            _print_table(rows)
+            click.echo()
+
+        click.echo(f"建议动作: {result.recommended_action}")
+    except Exception as e:
+        click.echo(f"{ERR} 复核失败: {e}", err=True)
+        sys.exit(1)
+
+
+@baseline.command("export")
+@click.argument("baseline_id", type=int)
+@click.option("-o", "--output", "output", default=None, help="输出 ZIP 文件路径")
+@click.pass_context
+def baseline_export(ctx, baseline_id, output):
+    """导出基线为 ZIP 文件。
+
+    导出内容包含基线定义、配置版本、指标阈值、来源摘要和复核历史，
+    可在另一份数据库或重启后导入查看。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.export_baseline(baseline_id, output_path=output)
+        click.echo(f"{OK} 基线已导出")
+        click.echo(f"  基线ID:     {result.baseline_id}")
+        click.echo(f"  基线名称:   {result.baseline_name}")
+        click.echo(f"  文件路径:   {result.file_path}")
+        click.echo(f"  文件大小:   {result.file_size:,} bytes")
+        click.echo(f"  SHA256:     {result.checksum_sha256[:16]}...")
+    except Exception as e:
+        click.echo(f"{ERR} 导出失败: {e}", err=True)
+        sys.exit(1)
+
+
+@baseline.command("import")
+@click.argument("file_path")
+@click.option("--on-conflict", type=click.Choice(["reject", "rename", "skip"]),
+              default=None, help="同名冲突处理策略（默认报错）")
+@click.option("--new-name", default=None, help="冲突时重命名为指定名称")
+@click.pass_context
+def baseline_import(ctx, file_path, on_conflict, new_name):
+    """从 ZIP 文件导入基线。
+
+    遇到同名基线时支持 reject（拒绝）/ rename（改名）/ skip（跳过）三种策略，
+    所有决定写入审计日志。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.import_baseline(file_path, on_conflict=on_conflict, new_name=new_name)
+        if not result.success:
+            click.echo(f"{ERR} 导入拒绝")
+            click.echo(f"  原名称:     {result.original_name}")
+            click.echo(f"  尝试名称:   {result.final_name}")
+            click.echo(f"  策略:       {result.conflict_action}")
+            click.echo(f"  原因:       {result.error_message}")
+            sys.exit(0)
+        if result.baseline_id == 0 and result.conflict_action == "skip":
+            click.echo(f"=  导入跳过（同名冲突已存在）")
+            click.echo(f"  原名称:     {result.original_name}")
+            click.echo(f"  策略:       skip")
+            return
+
+        click.echo(f"{OK} 基线已导入")
+        click.echo(f"  基线ID:     {result.baseline_id}")
+        click.echo(f"  原名称:     {result.original_name}")
+        click.echo(f"  最终名称:   {result.final_name}")
+        if result.conflict_action:
+            click.echo(f"  冲突策略:   {result.conflict_action}")
+    except Exception as e:
+        click.echo(f"{ERR} 导入失败: {e}", err=True)
+        sys.exit(1)
+
+
+@baseline.command("list")
+@click.option("--status", type=click.Choice(["active", "deprecated", "deleted"]),
+              default=None, help="按状态筛选")
+@click.option("--source-batch-id", type=int, default=None, help="按来源批次筛选")
+@click.pass_context
+def baseline_list(ctx, status, source_batch_id):
+    """列出所有基线，支持按状态和来源批次筛选。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        baselines = svc.list_baselines(status=status, source_batch_id=source_batch_id)
+        if not baselines:
+            click.echo("(暂无基线)")
+            return
+
+        status_labels = {
+            "active": "启用",
+            "deprecated": "弃用",
+            "deleted": "已删"
+        }
+        check_labels = {
+            "pass": "通过",
+            "warn": "警告",
+            "block": "阻断",
+            None: "-"
+        }
+
+        rows = []
+        for b in baselines:
+            last_check = check_labels.get(b.get("last_check_status"), b.get("last_check_status") or "-")
+            rows.append({
+                "ID": b["id"],
+                "名称": b["name"],
+                "状态": status_labels.get(b["status"], b["status"]),
+                "版本": f"v{b['config_version']}",
+                "来源批次": b.get("source_batch_name") or f"#{b.get('source_batch_id') or '-'}",
+                "上次复核": last_check,
+                "创建时间": b["created_at"][:19]
+            })
+        _print_table(rows)
+    except Exception as e:
+        click.echo(f"{ERR} 查询失败: {e}", err=True)
+        sys.exit(1)
+
+
+@baseline.command("show")
+@click.argument("baseline_id", type=int)
+@click.option("--config", is_flag=True, help="显示完整配置")
+@click.option("--thresholds", is_flag=True, help="显示指标阈值")
+@click.option("--checks", is_flag=True, help="显示最近复核历史")
+@click.pass_context
+def baseline_show(ctx, baseline_id, config, thresholds, checks):
+    """显示基线详情，可选择查看配置、阈值和复核历史。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        b = svc.get_baseline(baseline_id)
+        if not b:
+            click.echo(f"{ERR} 基线 #{baseline_id} 不存在", err=True)
+            sys.exit(1)
+
+        status_labels = {
+            "active": "启用",
+            "deprecated": "弃用",
+            "deleted": "已删"
+        }
+        check_labels = {
+            "pass": "通过",
+            "warn": "警告",
+            "block": "阻断"
+        }
+
+        click.echo(f"基线 #{b['id']}: {b['name']}")
+        click.echo(f"  状态:       {status_labels.get(b['status'], b['status'])}")
+        if b.get("description"):
+            click.echo(f"  备注:       {b['description']}")
+        click.echo(f"  配置版本:   v{b['config_version']}")
+        click.echo(f"  来源批次:   {b.get('source_batch_name') or '-'} (#{b.get('source_batch_id') or '-'})")
+        click.echo(f"  来源运行:   #{b.get('source_run_number') or '-'} (run_id=#{b.get('source_run_id') or '-'})")
+        if b.get("last_check_status"):
+            click.echo(f"  上次复核:   {check_labels.get(b['last_check_status'], b['last_check_status'])} @ {b.get('last_checked_at', '-')[:19]}")
+        if b.get("imported_from"):
+            click.echo(f"  导入来源:   {b['imported_from']}")
+            if b.get("original_baseline_id"):
+                click.echo(f"  原始基线ID: #{b['original_baseline_id']}")
+        click.echo(f"  创建时间:   {b['created_at'][:19]}")
+        click.echo(f"  更新时间:   {b['updated_at'][:19]}")
+        click.echo(f"  指标阈值:   {len(b.get('metric_thresholds', {}).get('metrics', {}))} 个指标")
+
+        if config:
+            click.echo()
+            click.echo("=== 配置 ===")
+            click.echo(json.dumps(b["config"], indent=2, ensure_ascii=False))
+
+        if thresholds:
+            click.echo()
+            click.echo("=== 指标阈值 ===")
+            mt = b.get("metric_thresholds", {})
+            click.echo(f"默认警告阈值: ±{mt.get('default_warn_pct', 5)}%")
+            click.echo(f"默认阻断阈值: ±{mt.get('default_block_pct', 15)}%")
+            metrics = mt.get("metrics", {})
+            if metrics:
+                rows = []
+                for name, t in metrics.items():
+                    rows.append({
+                        "指标": name,
+                        "基线值": f"{t.get('baseline_value', 0):.4f}",
+                        "警告阈": f"±{t.get('warn_threshold_pct', 5)}%",
+                        "阻断阈": f"±{t.get('block_threshold_pct', 15)}%"
+                    })
+                _print_table(rows)
+
+        if checks:
+            click.echo()
+            click.echo("=== 复核历史（最近10条）===")
+            history = svc.get_baseline_checks(baseline_id=baseline_id, limit=10)
+            if not history:
+                click.echo("(暂无复核记录)")
+            else:
+                rows = []
+                for h in history:
+                    rows.append({
+                        "ID": h["id"],
+                        "目标批次": h.get("target_batch_name") or f"#{h.get('target_batch_id') or '-'}",
+                        "结论": check_labels.get(h["check_status"], h["check_status"]),
+                        "通过": h["pass_count"],
+                        "警告": h["warn_count"],
+                        "阻断": h["block_count"],
+                        "时间": h["checked_at"][:19]
+                    })
+                _print_table(rows)
+    except Exception as e:
+        click.echo(f"{ERR} 查询失败: {e}", err=True)
+        sys.exit(1)
+
+
+@baseline.command("history")
+@click.argument("baseline_id", type=int, required=False)
+@click.option("--action", type=click.Choice([
+    "baseline_register", "baseline_check", "baseline_export",
+    "baseline_import", "baseline_delete"
+]), default=None, help="按操作类型筛选")
+@click.option("--result", type=click.Choice(["success", "failed", "blocked"]),
+              default=None, help="按结果筛选")
+@click.option("--limit", type=int, default=50, show_default=True, help="最多显示条数")
+@click.pass_context
+def baseline_history(ctx, baseline_id, action, result, limit):
+    """查看基线审计历史（注册/复核/导入/导出/删除）。
+
+    所有操作决定均记录在此，重启后仍可查询。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        logs = svc.get_baseline_audit_logs(
+            baseline_id=baseline_id,
+            action=action,
+            result=result,
+            limit=limit
+        )
+
+        if not logs:
+            click.echo("(暂无审计记录)")
+            return
+
+        action_labels = {
+            "baseline_register": "注册",
+            "baseline_check": "复核",
+            "baseline_export": "导出",
+            "baseline_import": "导入",
+            "baseline_delete": "删除"
+        }
+        result_labels = {
+            "success": "成功",
+            "failed": "失败",
+            "blocked": "阻止"
+        }
+
+        rows = []
+        for log in logs:
+            bl_info = f"#{log['baseline_id']}" if log.get("baseline_id") else "-"
+            batch_info = f"#{log['batch_id']}" if log.get("batch_id") else "-"
+
+            rows.append({
+                "ID": log["id"],
+                "时间": log["created_at"][:19],
+                "操作": action_labels.get(log["action"], log["action"]),
+                "基线": bl_info,
+                "批次": batch_info,
+                "结果": result_labels.get(log["result"], log["result"]),
+                "错误": log.get("error_message") or ""
+            })
+        _print_table(rows)
+    except Exception as e:
+        click.echo(f"{ERR} 查询失败: {e}", err=True)
+        sys.exit(1)
+
+
+@baseline.command("delete")
+@click.argument("baseline_id", type=int)
+@click.pass_context
+def baseline_delete(ctx, baseline_id):
+    """删除基线（软删除，保留历史记录和审计日志）。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.delete_baseline(baseline_id)
+        if not result:
+            click.echo(f"{ERR} 基线 #{baseline_id} 不存在", err=True)
+            sys.exit(1)
+        click.echo(f"{OK} 基线已删除（软删除，审计记录保留）")
+        click.echo(f"  基线ID:     {baseline_id}")
+    except Exception as e:
+        click.echo(f"{ERR} 删除失败: {e}", err=True)
+        sys.exit(1)
+
+
 def main():
     cli(obj={})
 

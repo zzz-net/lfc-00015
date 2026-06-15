@@ -154,6 +154,8 @@ def init_db(db_path: str = None) -> None:
                 source_scheme_id INTEGER,
                 snapshot_id INTEGER,
                 snapshot_name TEXT,
+                baseline_id INTEGER,
+                baseline_name TEXT,
                 action TEXT NOT NULL,
                 trigger_method TEXT NOT NULL,
                 previous_config_json TEXT,
@@ -197,6 +199,57 @@ def init_db(db_path: str = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_run_snapshots_batch_id ON run_snapshots(source_batch_id);
             CREATE INDEX IF NOT EXISTS idx_run_snapshots_run_id ON run_snapshots(source_run_id);
             CREATE INDEX IF NOT EXISTS idx_run_snapshots_status ON run_snapshots(status);
+
+            CREATE TABLE IF NOT EXISTS baselines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                source_batch_id INTEGER,
+                source_run_id INTEGER,
+                source_batch_name TEXT,
+                source_run_number INTEGER,
+                config_version INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                metric_thresholds_json TEXT NOT NULL,
+                source_summary_json TEXT,
+                last_check_status TEXT,
+                last_check_summary_json TEXT,
+                last_checked_at TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                original_baseline_id INTEGER,
+                imported_from TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (source_batch_id) REFERENCES batches(id) ON DELETE SET NULL,
+                FOREIGN KEY (source_run_id) REFERENCES runs(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_baselines_name ON baselines(name);
+            CREATE INDEX IF NOT EXISTS idx_baselines_batch_id ON baselines(source_batch_id);
+            CREATE INDEX IF NOT EXISTS idx_baselines_status ON baselines(status);
+            CREATE INDEX IF NOT EXISTS idx_baselines_last_check ON baselines(last_check_status);
+
+            CREATE TABLE IF NOT EXISTS baseline_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                baseline_id INTEGER NOT NULL,
+                target_batch_id INTEGER,
+                target_run_id INTEGER,
+                target_batch_name TEXT,
+                check_status TEXT NOT NULL,
+                total_metrics INTEGER NOT NULL,
+                pass_count INTEGER NOT NULL,
+                warn_count INTEGER NOT NULL,
+                block_count INTEGER NOT NULL,
+                details_json TEXT NOT NULL,
+                recommended_action TEXT,
+                checked_at TEXT NOT NULL,
+                FOREIGN KEY (baseline_id) REFERENCES baselines(id) ON DELETE CASCADE,
+                FOREIGN KEY (target_batch_id) REFERENCES batches(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_baseline_checks_baseline_id ON baseline_checks(baseline_id);
+            CREATE INDEX IF NOT EXISTS idx_baseline_checks_status ON baseline_checks(check_status);
+            CREATE INDEX IF NOT EXISTS idx_baseline_checks_target_batch ON baseline_checks(target_batch_id);
         """)
         conn.commit()
 
@@ -228,6 +281,12 @@ def init_db(db_path: str = None) -> None:
         if "snapshot_name" not in sal_cols:
             cursor.execute("ALTER TABLE scheme_audit_log ADD COLUMN snapshot_name TEXT")
             conn.commit()
+        if "baseline_id" not in sal_cols:
+            cursor.execute("ALTER TABLE scheme_audit_log ADD COLUMN baseline_id INTEGER")
+            conn.commit()
+        if "baseline_name" not in sal_cols:
+            cursor.execute("ALTER TABLE scheme_audit_log ADD COLUMN baseline_name TEXT")
+            conn.commit()
         if sal_cols.get("batch_id") == 1:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS scheme_audit_log_new (
@@ -238,6 +297,8 @@ def init_db(db_path: str = None) -> None:
                     source_scheme_id INTEGER,
                     snapshot_id INTEGER,
                     snapshot_name TEXT,
+                    baseline_id INTEGER,
+                    baseline_name TEXT,
                     action TEXT NOT NULL,
                     trigger_method TEXT NOT NULL,
                     previous_config_json TEXT,
@@ -803,6 +864,11 @@ AUDIT_ACTION_DRY_RUN = "dry_run"
 AUDIT_ACTION_SNAPSHOT_EXPORT = "snapshot_export"
 AUDIT_ACTION_SNAPSHOT_IMPORT = "snapshot_import"
 AUDIT_ACTION_SNAPSHOT_REPLAY = "snapshot_replay"
+AUDIT_ACTION_BASELINE_REGISTER = "baseline_register"
+AUDIT_ACTION_BASELINE_CHECK = "baseline_check"
+AUDIT_ACTION_BASELINE_EXPORT = "baseline_export"
+AUDIT_ACTION_BASELINE_IMPORT = "baseline_import"
+AUDIT_ACTION_BASELINE_DELETE = "baseline_delete"
 
 AUDIT_RESULT_SUCCESS = "success"
 AUDIT_RESULT_FAILED = "failed"
@@ -824,6 +890,8 @@ def add_scheme_audit_log(
     source_scheme_id: int = None,
     snapshot_id: int = None,
     snapshot_name: str = None,
+    baseline_id: int = None,
+    baseline_name: str = None,
     previous_config: Dict[str, Any] = None,
     new_config: Dict[str, Any] = None,
     config_diff: Dict[str, Any] = None,
@@ -851,14 +919,14 @@ def add_scheme_audit_log(
     cursor.execute("""
         INSERT INTO scheme_audit_log (
             batch_id, scheme_id, scheme_name, source_scheme_id,
-            snapshot_id, snapshot_name,
+            snapshot_id, snapshot_name, baseline_id, baseline_name,
             action, trigger_method,
             previous_config_json, new_config_json, config_diff_json,
             result, error_message, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         batch_id, scheme_id, scheme_name, source_scheme_id,
-        snapshot_id, snapshot_name,
+        snapshot_id, snapshot_name, baseline_id, baseline_name,
         action, trigger_method,
         json.dumps(previous_config, ensure_ascii=False) if previous_config else None,
         json.dumps(new_config, ensure_ascii=False) if new_config else None,
@@ -996,6 +1064,16 @@ SNAPSHOT_TYPE_BATCH = "batch"
 SNAPSHOT_TYPE_RUN = "run"
 
 SNAPSHOT_FORMAT_VERSION = "1.0"
+
+BASELINE_STATUS_ACTIVE = "active"
+BASELINE_STATUS_DEPRECATED = "deprecated"
+BASELINE_STATUS_DELETED = "deleted"
+
+BASELINE_CHECK_PASS = "pass"
+BASELINE_CHECK_WARN = "warn"
+BASELINE_CHECK_BLOCK = "block"
+
+BASELINE_FORMAT_VERSION = "1.0"
 
 
 def create_snapshot(conn: sqlite3.Connection, name: str, snapshot_type: str,
@@ -1150,6 +1228,258 @@ def get_snapshot_audit_logs(conn: sqlite3.Connection, snapshot_id: int = None,
     if snapshot_id is not None:
         query += " AND snapshot_id = ?"
         params.append(snapshot_id)
+    if action is not None:
+        query += " AND action = ?"
+        params.append(action)
+    if result is not None:
+        query += " AND result = ?"
+        params.append(result)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, params)
+    results = []
+    for row in cursor.fetchall():
+        r = dict(row)
+        if r.get("previous_config_json"):
+            r["previous_config"] = json.loads(r["previous_config_json"])
+            del r["previous_config_json"]
+        else:
+            r.pop("previous_config_json", None)
+        if r.get("new_config_json"):
+            r["new_config"] = json.loads(r["new_config_json"])
+            del r["new_config_json"]
+        else:
+            r.pop("new_config_json", None)
+        if r.get("config_diff_json"):
+            r["config_diff"] = json.loads(r["config_diff_json"])
+            del r["config_diff_json"]
+        else:
+            r.pop("config_diff_json", None)
+        results.append(r)
+    return results
+
+
+# ============ Baseline Operations ============
+
+def _unpack_baseline_row(row: sqlite3.Row) -> Dict[str, Any]:
+    """解包 baseline 行数据为字典"""
+    r = dict(row)
+    if r.get("config_json"):
+        r["config"] = json.loads(r["config_json"])
+        del r["config_json"]
+    if r.get("metric_thresholds_json"):
+        r["metric_thresholds"] = json.loads(r["metric_thresholds_json"])
+        del r["metric_thresholds_json"]
+    if r.get("source_summary_json"):
+        r["source_summary"] = json.loads(r["source_summary_json"])
+        del r["source_summary_json"]
+    if r.get("last_check_summary_json"):
+        r["last_check_summary"] = json.loads(r["last_check_summary_json"])
+        del r["last_check_summary_json"]
+    return r
+
+
+def _unpack_check_row(row: sqlite3.Row) -> Dict[str, Any]:
+    """解包 baseline_checks 行数据为字典"""
+    r = dict(row)
+    if r.get("details_json"):
+        r["details"] = json.loads(r["details_json"])
+        del r["details_json"]
+    return r
+
+
+def create_baseline(conn: sqlite3.Connection, name: str,
+                    source_batch_id: int, source_run_id: int,
+                    source_batch_name: str, source_run_number: int,
+                    config_version: int, config: Dict[str, Any],
+                    metric_thresholds: Dict[str, Any],
+                    source_summary: Dict[str, Any] = None,
+                    description: str = None,
+                    original_baseline_id: int = None,
+                    imported_from: str = None) -> int:
+    """创建基线，返回基线 ID"""
+    now = datetime.now().isoformat()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO baselines (
+            name, description,
+            source_batch_id, source_run_id, source_batch_name, source_run_number,
+            config_version, config_json, metric_thresholds_json, source_summary_json,
+            status, original_baseline_id, imported_from,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        name, description,
+        source_batch_id, source_run_id, source_batch_name, source_run_number,
+        config_version,
+        json.dumps(config, ensure_ascii=False),
+        json.dumps(metric_thresholds, ensure_ascii=False),
+        json.dumps(source_summary, ensure_ascii=False) if source_summary else None,
+        BASELINE_STATUS_ACTIVE,
+        original_baseline_id, imported_from,
+        now, now
+    ))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_baseline(conn: sqlite3.Connection, baseline_id: int) -> Optional[Dict[str, Any]]:
+    """按 ID 获取基线"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM baselines WHERE id = ?", (baseline_id,))
+    row = cursor.fetchone()
+    return _unpack_baseline_row(row) if row else None
+
+
+def get_baseline_by_name(conn: sqlite3.Connection, name: str) -> Optional[Dict[str, Any]]:
+    """按名称获取基线"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM baselines WHERE name = ?", (name,))
+    row = cursor.fetchone()
+    return _unpack_baseline_row(row) if row else None
+
+
+def list_baselines(conn: sqlite3.Connection, status: str = None,
+                   source_batch_id: int = None) -> List[Dict[str, Any]]:
+    """列出基线，支持按状态和来源批次筛选"""
+    cursor = conn.cursor()
+    query = "SELECT * FROM baselines WHERE 1=1"
+    params = []
+    if status is not None:
+        query += " AND status = ?"
+        params.append(status)
+    if source_batch_id is not None:
+        query += " AND source_batch_id = ?"
+        params.append(source_batch_id)
+    query += " ORDER BY id DESC"
+    cursor.execute(query, params)
+    return [_unpack_baseline_row(row) for row in cursor.fetchall()]
+
+
+def update_baseline_status(conn: sqlite3.Connection, baseline_id: int, status: str) -> bool:
+    """更新基线状态"""
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    cursor.execute("UPDATE baselines SET status = ?, updated_at = ? WHERE id = ?",
+                   (status, now, baseline_id))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def update_baseline_name(conn: sqlite3.Connection, baseline_id: int, new_name: str) -> bool:
+    """更新基线名称"""
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    cursor.execute("UPDATE baselines SET name = ?, updated_at = ? WHERE id = ?",
+                   (new_name, now, baseline_id))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def update_baseline_last_check(conn: sqlite3.Connection, baseline_id: int,
+                               check_status: str, summary: Dict[str, Any]) -> bool:
+    """更新基线最近一次复核结果"""
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    cursor.execute("""
+        UPDATE baselines SET last_check_status = ?, last_check_summary_json = ?,
+               last_checked_at = ?, updated_at = ? WHERE id = ?
+    """, (check_status, json.dumps(summary, ensure_ascii=False), now, now, baseline_id))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def delete_baseline(conn: sqlite3.Connection, baseline_id: int) -> bool:
+    """软删除基线（更新状态为 deleted）"""
+    return update_baseline_status(conn, baseline_id, BASELINE_STATUS_DELETED)
+
+
+def create_baseline_check(conn: sqlite3.Connection, baseline_id: int,
+                          target_batch_id: int, target_run_id: int,
+                          target_batch_name: str, check_status: str,
+                          total_metrics: int, pass_count: int,
+                          warn_count: int, block_count: int,
+                          details: Dict[str, Any],
+                          recommended_action: str = None) -> int:
+    """创建基线复核记录，返回复核记录 ID"""
+    now = datetime.now().isoformat()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO baseline_checks (
+            baseline_id, target_batch_id, target_run_id, target_batch_name,
+            check_status, total_metrics, pass_count, warn_count, block_count,
+            details_json, recommended_action, checked_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        baseline_id, target_batch_id, target_run_id, target_batch_name,
+        check_status, total_metrics, pass_count, warn_count, block_count,
+        json.dumps(details, ensure_ascii=False), recommended_action, now
+    ))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_baseline_checks(conn: sqlite3.Connection, baseline_id: int = None,
+                        target_batch_id: int = None,
+                        check_status: str = None,
+                        limit: int = 100) -> List[Dict[str, Any]]:
+    """查询基线复核历史，支持按基线、目标批次、状态筛选"""
+    cursor = conn.cursor()
+    query = "SELECT * FROM baseline_checks WHERE 1=1"
+    params = []
+    if baseline_id is not None:
+        query += " AND baseline_id = ?"
+        params.append(baseline_id)
+    if target_batch_id is not None:
+        query += " AND target_batch_id = ?"
+        params.append(target_batch_id)
+    if check_status is not None:
+        query += " AND check_status = ?"
+        params.append(check_status)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, params)
+    return [_unpack_check_row(row) for row in cursor.fetchall()]
+
+
+# ============ Baseline Audit Log Helpers ============
+
+def add_baseline_audit_log(conn: sqlite3.Connection, action: str,
+                           baseline_id: int = None, baseline_name: str = None,
+                           batch_id: int = None,
+                           result: str = AUDIT_RESULT_SUCCESS,
+                           trigger_method: str = AUDIT_TRIGGER_CLI,
+                           previous_config: Dict[str, Any] = None,
+                           new_config: Dict[str, Any] = None,
+                           config_diff: Dict[str, Any] = None,
+                           error_message: str = None,
+                           details: Dict[str, Any] = None) -> int:
+    """添加基线相关审计日志的便捷函数"""
+    return add_scheme_audit_log(
+        conn,
+        batch_id=batch_id,
+        action=action,
+        trigger_method=trigger_method,
+        result=result,
+        baseline_id=baseline_id,
+        baseline_name=baseline_name,
+        previous_config=previous_config,
+        new_config=new_config,
+        config_diff=config_diff,
+        error_message=error_message
+    )
+
+
+def get_baseline_audit_logs(conn: sqlite3.Connection, baseline_id: int = None,
+                            action: str = None, result: str = None,
+                            limit: int = 100) -> List[Dict[str, Any]]:
+    """查询基线审计日志，支持按基线、操作类型、结果筛选"""
+    cursor = conn.cursor()
+    query = "SELECT * FROM scheme_audit_log WHERE 1=1"
+    params = []
+    if baseline_id is not None:
+        query += " AND baseline_id = ?"
+        params.append(baseline_id)
     if action is not None:
         query += " AND action = ?"
         params.append(action)

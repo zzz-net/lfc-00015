@@ -73,6 +73,37 @@ python -m pipeline compare export 1 -o exports/ --format csv
 **审计日志：**
 所有快照操作（导出/导入/重放/删除）均写入审计日志，包含操作类型、快照信息、结果状态和错误原因。
 
+### 基线批次库 (Baseline Library)
+将已处理完成的批次登记为可复用基线，后续新批次可直接做指标漂移复核并给出通过/警告/阻断三级结论。基线库持久化保存配置版本、关键指标阈值、来源摘要、备注和最近一次复核结果，重启后完整可查。
+
+**核心概念：**
+- **基线 (Baseline)**：一个已处理批次的"金标准"快照，包含配置、指标阈值、来源信息
+- **三级复核状态**：
+  - `pass`（通过）：所有指标在警告阈值以内，可正常发布
+  - `warn`（警告）：有指标超出警告阈值但未达阻断阈值，需人工关注
+  - `block`（阻断）：有指标超出阻断阈值，停止发布，必须排查根因
+- **指标漂移阈值**：默认 warn=±5%，block=±15%，注册时可自定义
+
+**基线包内容（ZIP 压缩）：**
+- `baseline_summary.json`: 基线元数据（名称、配置版本、来源批次、状态、格式版本）
+- `config.json`: 完整的运行配置
+- `metric_thresholds.json`: 关键指标阈值（每个指标的基线值、warn/block 阈值百分比）
+- `source_summary.json`: 来源批次摘要（行数、列、源文件哈希、统计信息）
+- `check_history.json`: 复核历史摘要（总次数、各状态计数、最近记录）
+- `checksum.json`: 所有文件的 SHA256 校验和（含格式版本和文件大小）
+
+**冲突处理策略：**
+- `reject`（默认）: 检测到同名基线时报错拒绝，决定写入审计日志（result=blocked）
+- `rename`: 自动重命名（添加 `_imported_N` 后缀或指定 `--new-name`），写入审计日志
+- `skip`: 跳过冲突基线，不写入新记录
+
+**审计日志：**
+所有基线操作（注册/复核/导出/导入/删除）均写入 `scheme_audit_log` 表，新增字段 `baseline_id`、`baseline_name` 用于关联查询，支持按操作类型和结果筛选。
+
+**追溯字段：**
+- `original_baseline_id`: 导入基线的原始 ID（从原数据库导出时的 ID）
+- `imported_from`: 导入来源（ZIP 文件名或路径哈希）
+
 ## CLI 命令
 
 ### 基础命令
@@ -281,3 +312,12 @@ python samples/regression_test.py
 - **last-change 快速查看**：no_change/apply/threshold/rollback 各状态正确返回，跨重启持久化
 - **CLI import-apply 和 last-change 命令**：帮助文本正常、执行输出包含追溯字段、last-change 显示 import_apply 动作
 - **导入应用→切换回滚→继续处理→审计连续**：import-apply 后可回滚，last-change 显示回滚结果，审计历史完整
+- **快照导出**：ZIP 包包含所有必需文件（manifest/config/metrics/anomalies/errors/source_summary/dependencies/checksum），校验和正确
+- **快照跨重启/跨数据库导入**：导出后重启或在新数据库中导入，数据完整可查
+- **快照导入冲突处理**：reject/rename/skip 三种策略均正确工作
+- **源文件缺失导入**：源文件缺失时导入不阻止，记录警告，replay 时需指定替代文件
+- **配置版本冲突导入**：配置版本不兼容时导入不阻止，使用快照中的配置
+- **快照 replay 指标对比**：重放成功，指标对比输出差异、失败原因、是否可接受
+- **replay 容忍度机制**：指标差异超出容忍度时标记为不可接受，列出失败指标
+- **快照审计日志查询**：可按操作类型和结果筛选，所有快照操作均有审计记录
+- **CLI snapshot 命令**：帮助文本完整，输出与文档对齐

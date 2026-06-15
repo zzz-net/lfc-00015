@@ -832,6 +832,121 @@ class PipelineService:
         finally:
             conn.close()
 
+    # ============ Baseline Operations ============
+
+    def register_baseline(self, name: str, batch_id: int, run_id: int = None,
+                         description: str = None,
+                         warn_pct: float = 5.0,
+                         block_pct: float = 15.0) -> Dict[str, Any]:
+        """从已处理批次注册基线"""
+        from . import baseline as bl
+        conn = self._conn()
+        try:
+            return bl.register_baseline(
+                conn, name, batch_id, run_id=run_id,
+                description=description, warn_pct=warn_pct, block_pct=block_pct
+            )
+        finally:
+            conn.close()
+
+    def check_baseline(self, baseline_id: int, batch_id: int, run_id: int = None):
+        """用基线复核目标批次的指标漂移情况"""
+        from . import baseline as bl
+        conn = self._conn()
+        try:
+            return bl.check_baseline(conn, baseline_id, batch_id, run_id=run_id)
+        finally:
+            conn.close()
+
+    def export_baseline(self, baseline_id: int, output_path: str = None):
+        """导出基线为 ZIP 文件"""
+        from . import baseline as bl
+        conn = self._conn()
+        try:
+            return bl.export_baseline(conn, baseline_id, output_path=output_path)
+        finally:
+            conn.close()
+
+    def import_baseline(self, file_path: str, on_conflict: str = None,
+                       new_name: str = None):
+        """从 ZIP 文件导入基线"""
+        from . import baseline as bl
+        conn = self._conn()
+        try:
+            return bl.import_baseline(conn, file_path, on_conflict=on_conflict, new_name=new_name)
+        finally:
+            conn.close()
+
+    def get_baseline(self, baseline_id: int) -> Optional[Dict[str, Any]]:
+        """按 ID 获取基线"""
+        conn = self._conn()
+        try:
+            return db.get_baseline(conn, baseline_id)
+        finally:
+            conn.close()
+
+    def get_baseline_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """按名称获取基线"""
+        conn = self._conn()
+        try:
+            return db.get_baseline_by_name(conn, name)
+        finally:
+            conn.close()
+
+    def list_baselines(self, status: str = None, source_batch_id: int = None) -> List[Dict[str, Any]]:
+        """列出基线，支持按状态和来源批次筛选"""
+        conn = self._conn()
+        try:
+            return db.list_baselines(conn, status=status, source_batch_id=source_batch_id)
+        finally:
+            conn.close()
+
+    def get_baseline_checks(self, baseline_id: int = None, target_batch_id: int = None,
+                           check_status: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """查询基线复核历史"""
+        conn = self._conn()
+        try:
+            return db.get_baseline_checks(
+                conn, baseline_id=baseline_id, target_batch_id=target_batch_id,
+                check_status=check_status, limit=limit
+            )
+        finally:
+            conn.close()
+
+    def get_baseline_audit_logs(self, baseline_id: int = None,
+                               action: str = None, result: str = None,
+                               limit: int = 100) -> List[Dict[str, Any]]:
+        """查询基线审计日志"""
+        conn = self._conn()
+        try:
+            return db.get_baseline_audit_logs(
+                conn, baseline_id=baseline_id,
+                action=action, result=result, limit=limit
+            )
+        finally:
+            conn.close()
+
+    def delete_baseline(self, baseline_id: int) -> bool:
+        """软删除基线"""
+        from . import baseline as bl
+        conn = self._conn()
+        try:
+            baseline = db.get_baseline(conn, baseline_id)
+            if not baseline:
+                return False
+            result = db.delete_baseline(conn, baseline_id)
+            if result:
+                db.add_baseline_audit_log(
+                    conn,
+                    action=db.AUDIT_ACTION_BASELINE_DELETE,
+                    baseline_id=baseline_id,
+                    baseline_name=baseline["name"],
+                    result=db.AUDIT_RESULT_SUCCESS
+                )
+            return result
+        finally:
+            conn.close()
+
     def get_scheme_by_original_id(self, original_id: int) -> Optional[Dict[str, Any]]:
         """通过原始方案 ID 查找导入的方案（用于导入导出后的历史连续性）"""
         conn = self._conn()

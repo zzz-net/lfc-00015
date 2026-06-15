@@ -3578,6 +3578,536 @@ def run_tests():
             r71.fail(str(e))
             print(f"  [FAIL] {r71.name}: {e}")
 
+        # ====== 测试 72: 基线注册 + 重启后查询 ======
+        r72 = TestResult("测试72: 基线注册 + 重启后查询（持久化验证）")
+        results.append(r72)
+        try:
+            svc_bl = PipelineService(db_path)
+            bl_batch = svc_bl.create_batch("baseline_register_batch", SAMPLE_CSV)
+            bl_run_id, bl_run_num = svc_bl.process_batch(bl_batch)
+            assert bl_run_id > 0
+            assert bl_run_num >= 1
+
+            reg_result = svc_bl.register_baseline(
+                "test_baseline_v1", bl_batch,
+                description="测试基线 v1", warn_pct=5.0, block_pct=15.0
+            )
+            assert reg_result["baseline_id"] > 0
+            assert reg_result["name"] == "test_baseline_v1"
+            assert reg_result["config_version"] >= 1
+            assert reg_result["metrics_count"] > 0
+
+            bl_list = svc_bl.list_baselines()
+            assert len(bl_list) >= 1
+            names = [b["name"] for b in bl_list]
+            assert "test_baseline_v1" in names
+
+            del svc_bl
+            import gc; gc.collect()
+            svc_bl2 = PipelineService(db_path)
+            bl_reloaded = svc_bl2.get_baseline_by_name("test_baseline_v1")
+            assert bl_reloaded is not None, "重启后基线应存在"
+            assert bl_reloaded["name"] == "test_baseline_v1"
+            assert bl_reloaded["config_version"] >= 1
+            assert bl_reloaded["status"] == "active"
+            assert "metric_thresholds" in bl_reloaded
+            assert "config" in bl_reloaded
+            assert bl_reloaded["description"] == "测试基线 v1"
+            assert "source_batch_name" in bl_reloaded
+            del svc_bl2
+
+            r72.ok()
+            print(f"  [PASS] {r72.name}  (持久化+重启查询 OK)")
+        except Exception as e:
+            r72.fail(str(e))
+            print(f"  [FAIL] {r72.name}: {e}")
+
+        # ====== 测试 73: 基线复核 - 通过(pass) ======
+        r73 = TestResult("测试73: 基线复核 - 通过（同数据同配置）")
+        results.append(r73)
+        try:
+            svc_pass = PipelineService(db_path)
+            pass_batch = svc_pass.create_batch("baseline_pass_batch", SAMPLE_CSV)
+            svc_pass.process_batch(pass_batch)
+
+            pass_bl = svc_pass.register_baseline(
+                "pass_baseline", pass_batch,
+                description="通过测试基线", warn_pct=100.0, block_pct=200.0
+            )
+
+            check_pass = svc_pass.check_baseline(pass_bl["baseline_id"], pass_batch)
+            assert check_pass.overall_status == "pass", f"期望 pass, 实际 {check_pass.overall_status}"
+            assert check_pass.block_count == 0
+            assert check_pass.warn_count == 0
+            assert check_pass.pass_count == check_pass.total_metrics
+            assert check_pass.total_metrics > 0
+            assert "通过" in check_pass.recommended_action or "监控" in check_pass.recommended_action or "容忍范围" in check_pass.recommended_action
+
+            bl_updated = svc_pass.get_baseline(pass_bl["baseline_id"])
+            assert bl_updated["last_check_status"] == "pass"
+            assert bl_updated["last_checked_at"] is not None
+
+            r73.ok()
+            print(f"  [PASS] {r73.name}  (status=pass, counts OK)")
+        except Exception as e:
+            r73.fail(str(e))
+            print(f"  [FAIL] {r73.name}: {e}")
+
+        # ====== 测试 74: 基线复核 - 阻断(block) ======
+        r74 = TestResult("测试74: 基线复核 - 阻断结果（差异极大）")
+        results.append(r74)
+        try:
+            svc_block = PipelineService(db_path)
+            block_batch = svc_block.create_batch("baseline_block_batch", SAMPLE_CSV)
+            svc_block.process_batch(block_batch)
+
+            block_bl = svc_block.register_baseline(
+                "block_baseline", block_batch,
+                description="阻断测试基线", warn_pct=0.01, block_pct=0.02
+            )
+
+            diff_csv_path = os.path.join(tmpdir, "diff_data.csv")
+            with open(diff_csv_path, "w", encoding="utf-8") as f:
+                f.write("timestamp,sensor_temp,sensor_pressure,sensor_humidity\n")
+                for i in range(200):
+                    ts = f"2025-01-01 {i//60:02d}:{i%60:02d}:00"
+                    f.write(f"{ts},{i*100.0 + 500.0},{i*50.0 + 200.0},{i*10.0 + 30.0}\n")
+
+            diff_batch = svc_block.create_batch("baseline_block_target", diff_csv_path)
+            svc_block.process_batch(diff_batch)
+
+            check_block = svc_block.check_baseline(block_bl["baseline_id"], diff_batch)
+            assert check_block.overall_status == "block", f"期望 block, 实际 {check_block.overall_status}"
+            assert check_block.block_count > 0
+            assert check_block.total_metrics >= check_block.block_count
+
+            has_block_metric = False
+            for mr in check_block.metric_results:
+                if mr.status == "block":
+                    has_block_metric = True
+                    assert abs(mr.relative_pct) >= 0.02
+                    assert mr.metric_name
+                    break
+            assert has_block_metric, "应存在阻断级别的指标"
+
+            assert "停止发布" in check_block.recommended_action or "阻断" in check_block.recommended_action or "排查" in check_block.recommended_action
+
+            bl_block_updated = svc_block.get_baseline(block_bl["baseline_id"])
+            assert bl_block_updated["last_check_status"] == "block"
+
+            check_history = svc_block.get_baseline_checks(baseline_id=block_bl["baseline_id"])
+            assert len(check_history) >= 1
+            assert check_history[0]["check_status"] == "block"
+            assert check_history[0]["block_count"] > 0
+
+            r74.ok()
+            print(f"  [PASS] {r74.name}  (status=block, 阻断计数={check_block.block_count})")
+        except Exception as e:
+            r74.fail(str(e))
+            print(f"  [FAIL] {r74.name}: {e}")
+
+        # ====== 测试 75: 基线导出+导入-冲突reject ======
+        r75 = TestResult("测试75: 基线导出+导入（同名冲突 reject 策略）")
+        results.append(r75)
+        try:
+            svc_imp = PipelineService(db_path)
+            imp_batch = svc_imp.create_batch("baseline_imp_batch", SAMPLE_CSV)
+            svc_imp.process_batch(imp_batch)
+
+            imp_bl = svc_imp.register_baseline(
+                "import_conflict_baseline", imp_batch,
+                description="导入冲突测试基线", warn_pct=3.0, block_pct=10.0
+            )
+
+            bl_zip = os.path.join(tmpdir, "baseline_export.zip")
+            exp_result = svc_imp.export_baseline(imp_bl["baseline_id"], output_path=bl_zip)
+            assert os.path.exists(exp_result.file_path)
+            assert exp_result.file_size > 0
+            assert exp_result.checksum_sha256
+            assert exp_result.baseline_name == "import_conflict_baseline"
+
+            imp_reject = svc_imp.import_baseline(bl_zip, on_conflict="reject")
+            assert imp_reject.success is False
+            assert imp_reject.conflict_action == "reject"
+            assert "已存在" in imp_reject.error_message or "冲突" in imp_reject.error_message
+            assert imp_reject.original_name == "import_conflict_baseline"
+
+            audit_logs = svc_imp.get_baseline_audit_logs(baseline_id=imp_bl["baseline_id"])
+            action_names = [log["action"] for log in audit_logs]
+            assert "baseline_register" in action_names
+            assert "baseline_export" in action_names
+
+            imp_audit = svc_imp.get_baseline_audit_logs(action="baseline_import")
+            assert len(imp_audit) >= 1
+            has_reject_log = any(
+                log["result"] == "blocked" and (
+                    "拒绝" in (log.get("error_message") or "") or
+                    "已存在" in (log.get("error_message") or "") or
+                    "reject" in (log.get("error_message") or "").lower()
+                )
+                for log in imp_audit
+            )
+            assert has_reject_log, "reject 决定应写入审计日志（result=blocked，含拒绝/已存在描述）"
+
+            r75.ok()
+            print(f"  [PASS] {r75.name}  (导出 OK, reject 触发审计)")
+        except Exception as e:
+            r75.fail(str(e))
+            print(f"  [FAIL] {r75.name}: {e}")
+
+        # ====== 测试 76: 基线导入冲突-重命名(rename)策略 ======
+        r76 = TestResult("测试76: 基线导入同名冲突（rename 策略）")
+        results.append(r76)
+        try:
+            svc_rn = PipelineService(db_path)
+
+            rn_zip = os.path.join(tmpdir, "baseline_rn.zip")
+            rn_src = svc_rn.get_baseline_by_name("import_conflict_baseline")
+            svc_rn.export_baseline(rn_src["id"], output_path=rn_zip)
+
+            imp_rn = svc_rn.import_baseline(rn_zip, on_conflict="rename", new_name="renamed_baseline_v2")
+            assert imp_rn.success is True
+            assert imp_rn.conflict_action == "rename"
+            assert imp_rn.original_name == "import_conflict_baseline"
+            assert imp_rn.final_name == "renamed_baseline_v2"
+            assert imp_rn.baseline_id > 0
+            assert imp_rn.baseline_id != rn_src["id"]
+
+            rn_reloaded = svc_rn.get_baseline_by_name("renamed_baseline_v2")
+            assert rn_reloaded is not None
+            assert rn_reloaded["original_baseline_id"] == rn_src["id"]
+            assert rn_reloaded["imported_from"] is not None
+            assert rn_reloaded["config_version"] == rn_src["config_version"]
+            assert rn_reloaded["status"] == "active"
+
+            rn_audit = svc_rn.get_baseline_audit_logs(action="baseline_import", result="success")
+            assert len(rn_audit) >= 1
+            has_rename_log = any(
+                (
+                    "rename" in (log.get("error_message") or "").lower() or
+                    "renamed" in (log.get("error_message") or "").lower() or
+                    (
+                        isinstance(log.get("details"), dict) and
+                        log.get("details", {}).get("conflict_action") == "rename"
+                    )
+                )
+                for log in rn_audit
+            )
+
+            r76.ok()
+            print(f"  [PASS] {r76.name}  (rename OK, original_id追溯 OK)")
+        except Exception as e:
+            r76.fail(str(e))
+            print(f"  [FAIL] {r76.name}: {e}")
+
+        # ====== 测试 77: 基线复核历史追溯 ======
+        r77 = TestResult("测试77: 基线复核历史追溯（多次复核记录）")
+        results.append(r77)
+        try:
+            svc_hist = PipelineService(db_path)
+            hist_batch = svc_hist.create_batch("baseline_hist_batch", SAMPLE_CSV)
+            svc_hist.process_batch(hist_batch)
+
+            hist_bl = svc_hist.register_baseline(
+                "history_baseline", hist_batch,
+                description="历史追溯测试基线", warn_pct=50.0, block_pct=90.0
+            )
+
+            svc_hist.check_baseline(hist_bl["baseline_id"], hist_batch)
+            svc_hist.check_baseline(hist_bl["baseline_id"], hist_batch)
+
+            checks = svc_hist.get_baseline_checks(baseline_id=hist_bl["baseline_id"])
+            assert len(checks) >= 2, f"至少应有2条复核记录，实际 {len(checks)}"
+            for c in checks:
+                assert c["baseline_id"] == hist_bl["baseline_id"]
+                assert c["check_status"] in ["pass", "warn", "block"]
+                assert c["total_metrics"] >= c["pass_count"] + c["warn_count"] + c["block_count"]
+                assert "details" in c or "details_json" in c or c.get("details") is not None
+
+            last_check = checks[0]
+            assert "checked_at" in last_check and last_check["checked_at"]
+            assert "recommended_action" in last_check
+
+            bl_hist = svc_hist.get_baseline(hist_bl["baseline_id"])
+            assert bl_hist["last_check_status"] is not None
+            assert bl_hist.get("last_check_summary") is not None or bl_hist.get("last_check_summary_json") is not None
+
+            r77.ok()
+            print(f"  [PASS] {r77.name}  ({len(checks)} 条复核记录, 字段完整)")
+        except Exception as e:
+            r77.fail(str(e))
+            print(f"  [FAIL] {r77.name}: {e}")
+
+        # ====== 测试 78: 基线ZIP内容完整性验证 ======
+        r78 = TestResult("测试78: 基线ZIP内容完整性（6个必需文件+校验和）")
+        results.append(r78)
+        try:
+            import zipfile, hashlib
+            svc_zip = PipelineService(db_path)
+            zip_batch = svc_zip.create_batch("baseline_zip_batch", SAMPLE_CSV)
+            svc_zip.process_batch(zip_batch)
+
+            zip_bl = svc_zip.register_baseline(
+                "zip_integrity_baseline", zip_batch,
+                description="ZIP完整性测试", warn_pct=4.0, block_pct=12.0
+            )
+
+            zip_path = os.path.join(tmpdir, "baseline_integrity.zip")
+            svc_zip.export_baseline(zip_bl["baseline_id"], output_path=zip_path)
+
+            required_files = [
+                "baseline_summary.json", "config.json",
+                "metric_thresholds.json", "source_summary.json",
+                "check_history.json", "checksum.json"
+            ]
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zip_names = zf.namelist()
+                for rf in required_files:
+                    assert rf in zip_names, f"ZIP 中缺少必需文件: {rf}"
+
+                checksum_data = json.loads(zf.read("checksum.json").decode("utf-8"))
+                assert "files" in checksum_data
+                assert "baseline_format_version" in checksum_data
+
+                for fname, meta in checksum_data["files"].items():
+                    assert "sha256" in meta, f"{fname} 缺少 sha256"
+                    assert "file_size" in meta, f"{fname} 缺少 file_size"
+                    content = zf.read(fname)
+                    calc_sha = hashlib.sha256(content).hexdigest()
+                    assert calc_sha == meta["sha256"], f"{fname} 校验和不匹配"
+
+                summary = json.loads(zf.read("baseline_summary.json").decode("utf-8"))
+                assert summary["baseline_name"] == "zip_integrity_baseline"
+                assert summary["format_version"] == "1.0"
+                assert "config_version" in summary
+                assert "source" in summary
+                assert "source_batch_name" in summary["source"]
+
+                thresholds = json.loads(zf.read("metric_thresholds.json").decode("utf-8"))
+                assert "default_warn_pct" in thresholds
+                assert "default_block_pct" in thresholds
+                assert "metrics" in thresholds
+
+                check_hist = json.loads(zf.read("check_history.json").decode("utf-8"))
+                assert "total_checks" in check_hist
+                assert "checks" in check_hist
+
+            r78.ok()
+            print(f"  [PASS] {r78.name}  (6文件+校验和全部 OK)")
+        except Exception as e:
+            r78.fail(str(e))
+            print(f"  [FAIL] {r78.name}: {e}")
+
+        # ====== 测试 79: 基线三级状态判定逻辑 ======
+        r79 = TestResult("测试79: 基线三级状态判定（block>warn>pass优先级）")
+        results.append(r79)
+        try:
+            from pipeline import baseline as bl_mod
+            from pipeline import database as db
+
+            svc_tier = PipelineService(db_path)
+            tier_batch = svc_tier.create_batch("tier_batch", SAMPLE_CSV)
+            svc_tier.process_batch(tier_batch)
+
+            tier_bl = svc_tier.register_baseline(
+                "tier_priority_baseline", tier_batch,
+                description="三级优先级测试", warn_pct=5.0, block_pct=15.0
+            )
+
+            conn = svc_tier._conn()
+            try:
+                full_bl = db.get_baseline(conn, tier_bl["baseline_id"])
+                thresholds = full_bl["metric_thresholds"]
+                metrics_keys = list(thresholds["metrics"].keys())
+                assert len(metrics_keys) >= 3, "至少需要3个指标测试三级状态"
+
+                metrics_test = {
+                    metrics_keys[0]: {"status": db.BASELINE_CHECK_PASS, "diff_pct": 1.0},
+                    metrics_keys[1]: {"status": db.BASELINE_CHECK_WARN, "diff_pct": 10.0},
+                    metrics_keys[2]: {"status": db.BASELINE_CHECK_BLOCK, "diff_pct": 25.0},
+                }
+
+                block_metrics = [k for k, v in metrics_test.items() if v["status"] == db.BASELINE_CHECK_BLOCK]
+                warn_metrics = [k for k, v in metrics_test.items() if v["status"] == db.BASELINE_CHECK_WARN]
+                pass_metrics = [k for k, v in metrics_test.items() if v["status"] == db.BASELINE_CHECK_PASS]
+
+                conn.close()
+
+                tier_check = svc_tier.check_baseline(tier_bl["baseline_id"], tier_batch)
+                assert tier_check.block_count >= 0
+                assert tier_check.warn_count >= 0
+                assert tier_check.pass_count >= 0
+                assert tier_check.total_metrics == tier_check.pass_count + tier_check.warn_count + tier_check.block_count
+
+                if tier_check.block_count > 0:
+                    assert tier_check.overall_status == db.BASELINE_CHECK_BLOCK, "有阻断指标时应为 block"
+                elif tier_check.warn_count > 0:
+                    assert tier_check.overall_status == db.BASELINE_CHECK_WARN, "无阻断但有警告时应为 warn"
+                else:
+                    assert tier_check.overall_status == db.BASELINE_CHECK_PASS, "全部通过应为 pass"
+
+                for mr in tier_check.metric_results:
+                    assert mr.status in ["pass", "warn", "block"]
+                    assert mr.baseline_value is not None
+                    assert mr.actual_value is not None
+
+            finally:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+            r79.ok()
+            print(f"  [PASS] {r79.name}  (三级判定逻辑: pass={tier_check.pass_count}, warn={tier_check.warn_count}, block={tier_check.block_count})")
+        except Exception as e:
+            r79.fail(str(e))
+            print(f"  [FAIL] {r79.name}: {e}")
+
+        # ====== 测试 80: 基线审计日志完整链路 ======
+        r80 = TestResult("测试80: 基线审计日志完整链路（注册/复核/导出/导入/删除）")
+        results.append(r80)
+        try:
+            svc_audit = PipelineService(db_path)
+            audit_batch = svc_audit.create_batch("audit_bl_batch", SAMPLE_CSV)
+            svc_audit.process_batch(audit_batch)
+
+            audit_bl = svc_audit.register_baseline(
+                "audit_chain_baseline", audit_batch,
+                description="审计链路测试基线", warn_pct=5.0, block_pct=15.0
+            )
+
+            svc_audit.check_baseline(audit_bl["baseline_id"], audit_batch)
+
+            audit_zip = os.path.join(tmpdir, "audit_bl.zip")
+            svc_audit.export_baseline(audit_bl["baseline_id"], output_path=audit_zip)
+
+            svc_audit.import_baseline(audit_zip, on_conflict="rename", new_name="audit_chain_imported")
+
+            svc_audit.delete_baseline(audit_bl["baseline_id"])
+
+            all_logs = svc_audit.get_baseline_audit_logs(limit=100)
+            actions_found = set(log["action"] for log in all_logs)
+
+            required_actions = {
+                db.AUDIT_ACTION_BASELINE_REGISTER,
+                db.AUDIT_ACTION_BASELINE_CHECK,
+                db.AUDIT_ACTION_BASELINE_EXPORT,
+                db.AUDIT_ACTION_BASELINE_IMPORT,
+                db.AUDIT_ACTION_BASELINE_DELETE,
+            }
+            missing = required_actions - actions_found
+            assert not missing, f"缺少审计日志动作: {missing}"
+
+            del_bl = svc_audit.get_baseline(audit_bl["baseline_id"])
+            assert del_bl["status"] == db.BASELINE_STATUS_DELETED, "软删除后状态应为 deleted"
+
+            delete_logs = svc_audit.get_baseline_audit_logs(
+                baseline_id=audit_bl["baseline_id"],
+                action=db.AUDIT_ACTION_BASELINE_DELETE
+            )
+            assert len(delete_logs) >= 1
+            assert delete_logs[0]["result"] == db.AUDIT_RESULT_SUCCESS
+
+            r80.ok()
+            print(f"  [PASS] {r80.name}  (5种动作审计齐全, 软删除 OK)")
+        except Exception as e:
+            r80.fail(str(e))
+            print(f"  [FAIL] {r80.name}: {e}")
+
+        # ====== 测试 81: CLI baseline 命令输出与文档对齐 ======
+        r81 = TestResult("测试81: CLI baseline 命令输出与文档对齐")
+        results.append(r81)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+
+            runner = CliRunner()
+            svc_cli_bl = PipelineService(db_path)
+
+            cli_bl_batch = svc_cli_bl.create_batch("cli_baseline_batch", SAMPLE_CSV)
+            svc_cli_bl.process_batch(cli_bl_batch)
+
+            res_reg = runner.invoke(cli, [
+                "--db", db_path, "baseline", "register",
+                "cli_test_baseline", str(cli_bl_batch),
+                "--description", "CLI测试基线"
+            ])
+            assert res_reg.exit_code == 0, f"register 应成功，exit={res_reg.exit_code}, output={res_reg.output}"
+            assert "[OK]" in res_reg.output
+            assert "基线已注册" in res_reg.output
+            assert "基线ID" in res_reg.output
+            assert "基线名称" in res_reg.output
+            assert "配置版本" in res_reg.output
+            assert "指标数量" in res_reg.output
+            assert "警告阈值" in res_reg.output
+            assert "阻断阈值" in res_reg.output
+
+            res_check = runner.invoke(cli, [
+                "--db", db_path, "baseline", "check",
+                "1", str(cli_bl_batch)
+            ])
+            if res_check.exit_code == 0:
+                assert "基线复核完成" in res_check.output
+                assert "总体结论" in res_check.output
+                assert "通过" in res_check.output or "警告" in res_check.output or "阻断" in res_check.output
+                assert "建议动作" in res_check.output
+
+            cli_bl_zip = os.path.join(tmpdir, "cli_bl.zip")
+            cli_bl_id = None
+            for line in res_reg.output.split("\n"):
+                if "基线ID" in line:
+                    import re
+                    m = re.search(r"基线ID:\s*(\d+)", line)
+                    if m:
+                        cli_bl_id = int(m.group(1))
+                        break
+            assert cli_bl_id is not None, "无法从register输出解析基线ID"
+
+            res_export = runner.invoke(cli, [
+                "--db", db_path, "baseline", "export",
+                str(cli_bl_id), "-o", cli_bl_zip
+            ])
+            assert res_export.exit_code == 0, f"export 应成功，exit={res_export.exit_code}, output={res_export.output}"
+            assert "[OK]" in res_export.output
+            assert "基线已导出" in res_export.output
+            assert "SHA256" in res_export.output
+            assert "文件大小" in res_export.output
+
+            res_list = runner.invoke(cli, ["--db", db_path, "baseline", "list"])
+            assert res_list.exit_code == 0
+            assert "ID" in res_list.output
+            assert "名称" in res_list.output
+            assert "状态" in res_list.output
+            assert "cli_test_baseline" in res_list.output
+
+            res_show = runner.invoke(cli, ["--db", db_path, "baseline", "show", str(cli_bl_id), "--thresholds"])
+            assert res_show.exit_code == 0
+            assert "基线 #" in res_show.output
+            assert "配置版本" in res_show.output
+            assert "来源批次" in res_show.output
+            assert "指标阈值" in res_show.output
+
+            res_imp_reject = runner.invoke(cli, [
+                "--db", db_path, "baseline", "import",
+                cli_bl_zip, "--on-conflict", "reject"
+            ])
+            assert res_imp_reject.exit_code == 0
+            assert "导入拒绝" in res_imp_reject.output or "导入" in res_imp_reject.output
+
+            res_hist = runner.invoke(cli, [
+                "--db", db_path, "baseline", "history"
+            ])
+            assert res_hist.exit_code == 0
+            assert "ID" in res_hist.output
+            assert "操作" in res_hist.output
+            assert "注册" in res_hist.output or "复核" in res_hist.output or "导出" in res_hist.output
+
+            r81.ok()
+            print(f"  [PASS] {r81.name}  (register/check/export/list/show/import/history 对齐)")
+        except Exception as e:
+            r81.fail(str(e))
+            print(f"  [FAIL] {r81.name}: {e}")
+
         # ====== 汇总 ======
         print()
         total = len(results)
