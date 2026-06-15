@@ -145,6 +145,29 @@ def init_db(db_path: str = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_analysis_schemes_name ON analysis_schemes(name);
             CREATE INDEX IF NOT EXISTS idx_batch_scheme_history_batch_id ON batch_scheme_history(batch_id);
             CREATE INDEX IF NOT EXISTS idx_comparison_reports_scheme_id ON comparison_reports(scheme_id);
+
+            CREATE TABLE IF NOT EXISTS scheme_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                scheme_id INTEGER,
+                scheme_name TEXT,
+                source_scheme_id INTEGER,
+                action TEXT NOT NULL,
+                trigger_method TEXT NOT NULL,
+                previous_config_json TEXT,
+                new_config_json TEXT,
+                config_diff_json TEXT,
+                result TEXT NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE,
+                FOREIGN KEY (scheme_id) REFERENCES analysis_schemes(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_batch_id ON scheme_audit_log(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_scheme_id ON scheme_audit_log(scheme_id);
+            CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_action ON scheme_audit_log(action);
+            CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_result ON scheme_audit_log(result);
         """)
         conn.commit()
 
@@ -155,6 +178,16 @@ def init_db(db_path: str = None) -> None:
             cursor.execute(
                 "ALTER TABLE analysis_schemes ADD COLUMN source_scheme_id INTEGER "
                 "REFERENCES analysis_schemes(id) ON DELETE SET NULL"
+            )
+            conn.commit()
+        if "original_id" not in columns:
+            cursor.execute(
+                "ALTER TABLE analysis_schemes ADD COLUMN original_id INTEGER"
+            )
+            conn.commit()
+        if "imported_from" not in columns:
+            cursor.execute(
+                "ALTER TABLE analysis_schemes ADD COLUMN imported_from TEXT"
             )
             conn.commit()
 
@@ -422,15 +455,16 @@ REQUIRED_SCHEME_FIELDS = {"cleaning", "missing_values", "anomaly_detection", "me
 
 
 def create_scheme(conn: sqlite3.Connection, name: str, config: Dict[str, Any],
-                  description: str = None, source_scheme_id: int = None) -> int:
+                  description: str = None, source_scheme_id: int = None,
+                  original_id: int = None, imported_from: str = None) -> int:
     """创建新分析方案，返回方案 ID"""
     now = datetime.now().isoformat()
     config_json = json.dumps(config, ensure_ascii=False)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO analysis_schemes (name, description, scheme_version, config_json, source_scheme_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (name, description, SCHEME_VERSION, config_json, source_scheme_id, now, now))
+        INSERT INTO analysis_schemes (name, description, scheme_version, config_json, source_scheme_id, original_id, imported_from, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (name, description, SCHEME_VERSION, config_json, source_scheme_id, original_id, imported_from, now, now))
     conn.commit()
     return cursor.lastrowid
 
@@ -481,8 +515,21 @@ def get_scheme_by_name(conn: sqlite3.Connection, name: str) -> Optional[Dict[str
 def list_schemes(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     """列出所有分析方案（不含 config 详情，节省内存）"""
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, description, scheme_version, source_scheme_id, created_at, updated_at FROM analysis_schemes ORDER BY updated_at DESC")
+    cursor.execute("SELECT id, name, description, scheme_version, source_scheme_id, original_id, imported_from, created_at, updated_at FROM analysis_schemes ORDER BY updated_at DESC")
     return [dict(row) for row in cursor.fetchall()]
+
+
+def get_scheme_by_original_id(conn: sqlite3.Connection, original_id: int) -> Optional[Dict[str, Any]]:
+    """按原始 ID（导入前的原始 ID）查找方案，用于导入后历史追溯"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM analysis_schemes WHERE original_id = ? ORDER BY id DESC LIMIT 1", (original_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["config"] = json.loads(result["config_json"])
+    del result["config_json"]
+    return result
 
 
 def delete_scheme(conn: sqlite3.Connection, scheme_id: int) -> None:
@@ -672,3 +719,153 @@ def get_scheme_history_by_id(conn: sqlite3.Connection, history_id: int) -> Optio
     r["config"] = json.loads(r["config_json"])
     del r["config_json"]
     return r
+
+
+# ============ Scheme Audit Log Operations ============
+
+AUDIT_ACTION_APPLY = "apply"
+AUDIT_ACTION_CLONE_APPLY = "clone_apply"
+AUDIT_ACTION_DERIVE_APPLY = "derive_apply"
+AUDIT_ACTION_ROLLBACK = "rollback"
+AUDIT_ACTION_DIRECT_MODIFY = "direct_modify"
+AUDIT_ACTION_DRY_RUN = "dry_run"
+
+AUDIT_RESULT_SUCCESS = "success"
+AUDIT_RESULT_FAILED = "failed"
+AUDIT_RESULT_BLOCKED = "blocked"
+
+AUDIT_TRIGGER_CLI = "cli"
+AUDIT_TRIGGER_API = "api"
+AUDIT_TRIGGER_IMPORT = "import"
+
+
+def add_scheme_audit_log(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    action: str,
+    trigger_method: str,
+    result: str,
+    scheme_id: int = None,
+    scheme_name: str = None,
+    source_scheme_id: int = None,
+    previous_config: Dict[str, Any] = None,
+    new_config: Dict[str, Any] = None,
+    config_diff: Dict[str, Any] = None,
+    error_message: str = None
+) -> int:
+    """添加方案审计日志，返回日志 ID"""
+    now = datetime.now().isoformat()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id FROM batches WHERE id = ?", (batch_id,))
+    if not cursor.fetchone():
+        return 0
+
+    if scheme_id is not None:
+        cursor.execute("SELECT id FROM analysis_schemes WHERE id = ?", (scheme_id,))
+        if not cursor.fetchone():
+            scheme_id = None
+
+    if source_scheme_id is not None:
+        cursor.execute("SELECT id FROM analysis_schemes WHERE id = ?", (source_scheme_id,))
+        if not cursor.fetchone():
+            source_scheme_id = None
+
+    cursor.execute("""
+        INSERT INTO scheme_audit_log (
+            batch_id, scheme_id, scheme_name, source_scheme_id,
+            action, trigger_method,
+            previous_config_json, new_config_json, config_diff_json,
+            result, error_message, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        batch_id, scheme_id, scheme_name, source_scheme_id,
+        action, trigger_method,
+        json.dumps(previous_config, ensure_ascii=False) if previous_config else None,
+        json.dumps(new_config, ensure_ascii=False) if new_config else None,
+        json.dumps(config_diff, ensure_ascii=False) if config_diff else None,
+        result, error_message, now
+    ))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_scheme_audit_logs(conn: sqlite3.Connection, batch_id: int = None, scheme_id: int = None,
+                          action: str = None, result: str = None,
+                          limit: int = 100) -> List[Dict[str, Any]]:
+    """查询方案审计日志，支持按批次、方案、操作类型、结果筛选"""
+    cursor = conn.cursor()
+    query = "SELECT * FROM scheme_audit_log WHERE 1=1"
+    params = []
+    if batch_id is not None:
+        query += " AND batch_id = ?"
+        params.append(batch_id)
+    if scheme_id is not None:
+        query += " AND scheme_id = ?"
+        params.append(scheme_id)
+    if action is not None:
+        query += " AND action = ?"
+        params.append(action)
+    if result is not None:
+        query += " AND result = ?"
+        params.append(result)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, params)
+    results = []
+    for row in cursor.fetchall():
+        r = dict(row)
+        if r.get("previous_config_json"):
+            r["previous_config"] = json.loads(r["previous_config_json"])
+            del r["previous_config_json"]
+        if r.get("new_config_json"):
+            r["new_config"] = json.loads(r["new_config_json"])
+            del r["new_config_json"]
+        if r.get("config_diff_json"):
+            r["config_diff"] = json.loads(r["config_diff_json"])
+            del r["config_diff_json"]
+        results.append(r)
+    return results
+
+
+def compute_config_diff(previous_config: Dict[str, Any], new_config: Dict[str, Any]) -> Dict[str, Any]:
+    """计算两个配置的差异，返回新增、修改、删除的字段"""
+    diff = {
+        "added": {},
+        "modified": {},
+        "removed": {},
+        "version_change": None
+    }
+
+    def _flatten(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+        flat = {}
+        for k, v in d.items():
+            key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                flat.update(_flatten(v, key))
+            else:
+                flat[key] = v
+        return flat
+
+    prev_flat = _flatten(previous_config or {})
+    new_flat = _flatten(new_config or {})
+
+    all_keys = set(prev_flat.keys()) | set(new_flat.keys())
+    for key in all_keys:
+        if key not in prev_flat:
+            diff["added"][key] = new_flat[key]
+        elif key not in new_flat:
+            diff["removed"][key] = prev_flat[key]
+        elif prev_flat[key] != new_flat[key]:
+            diff["modified"][key] = {
+                "old": prev_flat[key],
+                "new": new_flat[key]
+            }
+
+    if "version" in prev_flat and "version" in new_flat:
+        diff["version_change"] = {
+            "old": prev_flat["version"],
+            "new": new_flat["version"]
+        }
+
+    return diff

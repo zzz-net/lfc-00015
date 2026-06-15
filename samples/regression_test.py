@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pipeline.service import (
     PipelineService, BatchLockedError, BatchServiceError,
     SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult,
-    SchemeDeriveResult, SchemeRollbackResult
+    SchemeDeriveResult, SchemeRollbackResult, DryRunResult, DryRunRisk
 )
 from pipeline import database as db
 from pipeline.processor import import_csv
@@ -1795,6 +1795,420 @@ def run_tests():
         except Exception as e:
             r38.fail(str(e))
             print(f"  [FAIL] {r38.name}: {e}")
+
+        # ====== 测试 39: Dry-Run 预检成功 ======
+        r39 = TestResult("测试39: dry-run 预检成功，无风险，can_proceed=True，配置变更预览正确")
+        results.append(r39)
+        try:
+            svc_dry1 = PipelineService(db_path)
+
+            dr_base_bid = svc_dry1.create_batch("dryrun_base", SAMPLE_CSV)
+            svc_dry1.process_batch(dr_base_bid)
+            dr_src_sid = svc_dry1.save_scheme("dryrun_source", batch_id=dr_base_bid, description="预检源方案")
+
+            dr_target_bid = svc_dry1.create_batch("dryrun_target", SAMPLE_CSV)
+            svc_dry1.process_batch(dr_target_bid)
+
+            result = svc_dry1.dry_run_apply_scheme(dr_src_sid, dr_target_bid)
+            assert isinstance(result, DryRunResult)
+            assert result.can_proceed is True, "无风险时 can_proceed 应为 True"
+            assert len(result.risks) == 0, f"无风险时 risks 应为空，实际 {len(result.risks)}"
+            assert result.scheme_id == dr_src_sid
+            assert result.scheme_name == "dryrun_source"
+            assert result.batch_id == dr_target_bid
+
+            assert result.config_diff is not None, "预检成功时应返回配置差异"
+            assert "version_change" in result.config_diff
+            assert result.config_diff["version_change"]["old"] >= 1
+            assert result.config_diff["version_change"]["new"] > result.config_diff["version_change"]["old"]
+
+            audit_logs = svc_dry1.get_scheme_audit_logs(batch_id=dr_target_bid, action="dry_run")
+            assert len(audit_logs) >= 1, "dry-run 应记录审计日志"
+            latest_audit = audit_logs[0]
+            assert latest_audit["action"] == "dry_run"
+            assert latest_audit["trigger_method"] == "cli"
+            assert latest_audit["result"] == "success"
+            assert latest_audit["scheme_id"] == dr_src_sid
+            assert latest_audit["batch_id"] == dr_target_bid
+
+            r39.ok()
+            print(f"  [PASS] {r39.name}  (version_change=v{result.config_diff['version_change']['old']}→v{result.config_diff['version_change']['new']})")
+        except Exception as e:
+            r39.fail(str(e))
+            print(f"  [FAIL] {r39.name}: {e}")
+
+        # ====== 测试 40: Dry-Run 预检拦截（锁定批次、名称冲突、方案不存在） ======
+        r40 = TestResult("测试40: dry-run 预检拦截，锁定批次/名称冲突/方案不存在等场景正确阻止")
+        results.append(r40)
+        try:
+            svc_dry2 = PipelineService(db_path)
+
+            dr_lock_bid = svc_dry2.create_batch("dryrun_locked", SAMPLE_CSV)
+            svc_dry2.process_batch(dr_lock_bid)
+            svc_dry2.lock_batch(dr_lock_bid)
+            dr_src2_sid = svc_dry2.save_scheme("dryrun_source2", batch_id=dr_lock_bid)
+
+            result_lock = svc_dry2.dry_run_apply_scheme(dr_src2_sid, dr_lock_bid)
+            assert result_lock.can_proceed is False, "锁定批次时 can_proceed 应为 False"
+            lock_risks = [r for r in result_lock.risks if r.risk_type == DryRunRisk.RISK_LOCKED]
+            assert len(lock_risks) >= 1, "应检测到批次锁定风险"
+            assert lock_risks[0].severity == DryRunRisk.SEVERITY_BLOCKER
+
+            svc_dry2.unlock_batch(dr_lock_bid)
+
+            exist_sid = svc_dry2.save_scheme("existing_scheme", batch_id=dr_lock_bid)
+            result_name = svc_dry2.dry_run_apply_scheme(
+                dr_src2_sid, dr_lock_bid,
+                new_scheme_name="existing_scheme",
+                source_scheme_id=dr_src2_sid
+            )
+            assert result_name.can_proceed is False, "名称冲突时 can_proceed 应为 False"
+            name_risks = [r for r in result_name.risks if r.risk_type == DryRunRisk.RISK_NAME_CONFLICT]
+            assert len(name_risks) >= 1, "应检测到名称冲突风险"
+            assert name_risks[0].details["new_name"] == "existing_scheme"
+            assert name_risks[0].details["existing_scheme_id"] == exist_sid
+
+            result_scheme_missing = svc_dry2.dry_run_apply_scheme(99999, dr_lock_bid)
+            assert result_scheme_missing.can_proceed is False, "方案不存在时 can_proceed 应为 False"
+            scheme_risks = [r for r in result_scheme_missing.risks if r.risk_type == DryRunRisk.RISK_SCHEME_NOT_FOUND]
+            assert len(scheme_risks) >= 1, "应检测到方案不存在风险"
+
+            result_source_missing = svc_dry2.dry_run_apply_scheme(
+                dr_src2_sid, dr_lock_bid,
+                new_scheme_name="new_scheme_ok",
+                source_scheme_id=99999
+            )
+            assert result_source_missing.can_proceed is False, "源方案不存在时 can_proceed 应为 False"
+            source_risks = [r for r in result_source_missing.risks if r.risk_type == DryRunRisk.RISK_SOURCE_MISSING]
+            assert len(source_risks) >= 1, "应检测到源方案缺失风险"
+
+            result_batch_missing = svc_dry2.dry_run_apply_scheme(dr_src2_sid, 99999)
+            assert result_batch_missing.can_proceed is False, "批次不存在时 can_proceed 应为 False"
+            batch_risks = [r for r in result_batch_missing.risks if r.risk_type == DryRunRisk.RISK_BATCH_NOT_FOUND]
+            assert len(batch_risks) >= 1, "应检测到批次不存在风险"
+
+            blocked_logs = svc_dry2.get_scheme_audit_logs(batch_id=dr_lock_bid, result="blocked")
+            assert len(blocked_logs) >= 2, "阻止的预检应记录审计日志"
+            for bl in blocked_logs:
+                assert bl["result"] == "blocked"
+                assert bl["error_message"] is not None and len(bl["error_message"]) > 0
+
+            r40.ok()
+            print(f"  [PASS] {r40.name}  (locked/conflict/missing 全部拦截)")
+        except Exception as e:
+            r40.fail(str(e))
+            print(f"  [FAIL] {r40.name}: {e}")
+
+        # ====== 测试 41: 执行成功后历史可查 ======
+        r41 = TestResult("测试41: apply/clone-apply/derive-apply 成功后审计日志完整可查")
+        results.append(r41)
+        try:
+            svc_audit1 = PipelineService(db_path)
+
+            audit1_base_bid = svc_audit1.create_batch("audit1_base", SAMPLE_CSV)
+            svc_audit1.process_batch(audit1_base_bid)
+            audit1_src_sid = svc_audit1.save_scheme("audit1_source", batch_id=audit1_base_bid)
+
+            audit1_target1 = svc_audit1.create_batch("audit1_target1", SAMPLE_CSV)
+            svc_audit1.process_batch(audit1_target1)
+            cfg1 = svc_audit1.apply_scheme_to_batch(audit1_src_sid, audit1_target1)
+
+            apply_logs = svc_audit1.get_scheme_audit_logs(batch_id=audit1_target1, action="apply")
+            assert len(apply_logs) >= 1, "apply 成功应记录审计日志"
+            al = apply_logs[0]
+            assert al["action"] == "apply"
+            assert al["result"] == "success"
+            assert al["trigger_method"] == "cli"
+            assert al["scheme_id"] == audit1_src_sid
+            assert al["batch_id"] == audit1_target1
+            assert al["previous_config"] is not None
+            assert al["new_config"] is not None
+            assert al["config_diff"] is not None
+            assert al["error_message"] is None
+            assert al["config_diff"]["version_change"]["new"] == cfg1["version"]
+
+            audit1_target2 = svc_audit1.create_batch("audit1_target2", SAMPLE_CSV)
+            svc_audit1.process_batch(audit1_target2)
+            clone_result = svc_audit1.clone_and_apply_scheme(
+                audit1_src_sid, "audit1_cloned", audit1_target2)
+
+            clone_logs = svc_audit1.get_scheme_audit_logs(batch_id=audit1_target2, action="clone_apply")
+            assert len(clone_logs) >= 1, "clone-apply 成功应记录审计日志"
+            cl = clone_logs[0]
+            assert cl["action"] == "clone_apply"
+            assert cl["result"] == "success"
+            assert cl["scheme_id"] == clone_result.cloned_scheme_id
+            assert cl["source_scheme_id"] == audit1_src_sid
+            assert cl["config_diff"] is not None
+
+            audit1_target3 = svc_audit1.create_batch("audit1_target3", SAMPLE_CSV)
+            svc_audit1.process_batch(audit1_target3)
+            derive_result = svc_audit1.derive_and_apply_scheme(
+                audit1_src_sid, "audit1_derived", audit1_target3)
+
+            derive_logs = svc_audit1.get_scheme_audit_logs(batch_id=audit1_target3, action="derive_apply")
+            assert len(derive_logs) >= 1, "derive-apply 成功应记录审计日志"
+            dl = derive_logs[0]
+            assert dl["action"] == "derive_apply"
+            assert dl["result"] == "success"
+            assert dl["scheme_id"] == derive_result.derived_scheme_id
+            assert dl["source_scheme_id"] == audit1_src_sid
+
+            all_logs = svc_audit1.get_scheme_audit_logs(scheme_id=audit1_src_sid)
+            assert len(all_logs) >= 1, "按方案 ID 筛选应返回相关日志"
+
+            success_logs = svc_audit1.get_scheme_audit_logs(result="success", limit=10)
+            assert len(success_logs) >= 3, "按成功筛选应返回至少 3 条"
+
+            r41.ok()
+            print(f"  [PASS] {r41.name}  (apply/clone/derive 审计完整)")
+        except Exception as e:
+            r41.fail(str(e))
+            print(f"  [FAIL] {r41.name}: {e}")
+
+        # ====== 测试 42: 执行失败后历史可查 ======
+        r42 = TestResult("测试42: 执行失败/阻止后审计日志可查，含错误原因，可按 result 筛选")
+        results.append(r42)
+        try:
+            svc_audit2 = PipelineService(db_path)
+
+            audit2_src_sid = svc_audit2.save_scheme("audit2_source", batch_id=batch_id)
+
+            audit2_lock_bid = svc_audit2.create_batch("audit2_locked", SAMPLE_CSV)
+            svc_audit2.process_batch(audit2_lock_bid)
+            svc_audit2.lock_batch(audit2_lock_bid)
+
+            try:
+                svc_audit2.apply_scheme_to_batch(audit2_src_sid, audit2_lock_bid)
+                assert False, "锁定批次 apply 应抛出 BatchLockedError"
+            except BatchLockedError:
+                pass
+
+            fail_logs = svc_audit2.get_scheme_audit_logs(batch_id=audit2_lock_bid, result="blocked")
+            assert len(fail_logs) >= 1, "失败的 apply 应记录审计日志"
+            fl = fail_logs[0]
+            assert fl["action"] == "apply"
+            assert fl["result"] == "blocked"
+            assert fl["error_message"] is not None
+            assert "锁定" in fl["error_message"] or "locked" in fl["error_message"].lower()
+            assert fl["previous_config"] is not None
+            assert fl.get("new_config") is None
+
+            try:
+                svc_audit2.clone_and_apply_scheme(
+                    audit2_src_sid, "audit2_should_not_exist", audit2_lock_bid)
+                assert False, "锁定批次 clone-apply 应抛出 BatchLockedError"
+            except BatchLockedError:
+                pass
+
+            clone_fail_logs = svc_audit2.get_scheme_audit_logs(
+                batch_id=audit2_lock_bid, action="clone_apply", result="blocked")
+            assert len(clone_fail_logs) >= 1, "失败的 clone-apply 应记录审计日志"
+            cfl = clone_fail_logs[0]
+            assert cfl["result"] == "blocked"
+            assert cfl["error_message"] is not None
+
+            try:
+                svc_audit2.derive_and_apply_scheme(
+                    audit2_src_sid, "audit2_derive_should_not_exist", audit2_lock_bid)
+                assert False, "锁定批次 derive-apply 应抛出 BatchLockedError"
+            except BatchLockedError:
+                pass
+
+            derive_fail_logs = svc_audit2.get_scheme_audit_logs(
+                batch_id=audit2_lock_bid, action="derive_apply", result="blocked")
+            assert len(derive_fail_logs) >= 1, "失败的 derive-apply 应记录审计日志"
+
+            blocked_all = svc_audit2.get_scheme_audit_logs(result="blocked")
+            assert len(blocked_all) >= 3, "按 blocked 筛选应返回所有阻止记录"
+
+            svc_audit2.unlock_batch(audit2_lock_bid)
+
+            r42.ok()
+            print(f"  [PASS] {r42.name}  (apply/clone/derive 失败均记录，含错误原因)")
+        except Exception as e:
+            r42.fail(str(e))
+            print(f"  [FAIL] {r42.name}: {e}")
+
+        # ====== 测试 43: 导入导出后历史连续 ======
+        r43 = TestResult("测试43: 方案导出再导入后，通过 original_id 保持关联，继续应用时历史不中断")
+        results.append(r43)
+        try:
+            svc_ie2 = PipelineService(db_path)
+
+            ie2_src_bid = svc_ie2.create_batch("ie2_src", SAMPLE_CSV)
+            svc_ie2.process_batch(ie2_src_bid)
+            ie2_src_sid = svc_ie2.save_scheme("ie2_source", batch_id=ie2_src_bid, description="导入导出审计源")
+
+            ie2_derive_sid = svc_ie2.derive_scheme(ie2_src_sid, "ie2_derive", "审计用派生方案")
+            ie2_apply_bid = svc_ie2.create_batch("ie2_apply", SAMPLE_CSV)
+            svc_ie2.process_batch(ie2_apply_bid)
+            svc_ie2.apply_scheme_to_batch(ie2_derive_sid, ie2_apply_bid)
+
+            ie2_export_dir = os.path.join(tmpdir, "ie2_exports")
+            os.makedirs(ie2_export_dir, exist_ok=True)
+            ie2_export_path = os.path.join(ie2_export_dir, "ie2_derive.json")
+            svc_ie2.export_scheme_to_file(ie2_derive_sid, ie2_export_path)
+
+            with open(ie2_export_path, "r", encoding="utf-8") as f:
+                exported_data = json.load(f)
+            assert exported_data.get("original_id") == ie2_derive_sid, "导出数据应包含 original_id"
+            assert exported_data.get("source_scheme_id") == ie2_src_sid, "导出数据应包含 source_scheme_id"
+
+            import_result = svc_ie2.import_scheme_from_file(
+                ie2_export_path, on_conflict=SchemeImportResult.ACTION_RENAME,
+                new_name="ie2_imported")
+            assert import_result.success
+
+            imported_scheme = svc_ie2.get_scheme(import_result.scheme_id)
+            assert imported_scheme["original_id"] == ie2_derive_sid, "导入后应保留 original_id"
+            assert imported_scheme["source_scheme_id"] == ie2_src_sid, "导入后应保留 source_scheme_id"
+            assert imported_scheme["imported_from"] is not None, "导入后应记录 imported_from"
+
+            found_by_original = svc_ie2.get_scheme_by_original_id(ie2_derive_sid)
+            assert found_by_original is not None, "应能通过 original_id 找到导入的方案"
+            assert found_by_original["id"] == import_result.scheme_id
+
+            ie2_apply2_bid = svc_ie2.create_batch("ie2_apply2", SAMPLE_CSV)
+            svc_ie2.process_batch(ie2_apply2_bid)
+            cfg_ie2 = svc_ie2.apply_scheme_to_batch(import_result.scheme_id, ie2_apply2_bid)
+
+            ie2_logs = svc_ie2.get_scheme_audit_logs(batch_id=ie2_apply2_bid)
+            assert len(ie2_logs) >= 1, "导入方案的应用应记录审计日志"
+            ie2_audit = ie2_logs[0]
+            assert ie2_audit["scheme_id"] == import_result.scheme_id
+            assert ie2_audit["source_scheme_id"] == ie2_src_sid
+
+            original_logs = svc_ie2.get_scheme_audit_logs(scheme_id=ie2_derive_sid)
+            new_logs = svc_ie2.get_scheme_audit_logs(scheme_id=import_result.scheme_id)
+            assert len(original_logs) >= 1 and len(new_logs) >= 1, "原始和导入方案的历史都可查询"
+
+            r43.ok()
+            print(f"  [PASS] {r43.name}  (original_id={ie2_derive_sid}, imported_id={import_result.scheme_id}, history_continuous)")
+        except Exception as e:
+            r43.fail(str(e))
+            print(f"  [FAIL] {r43.name}: {e}")
+
+        # ====== 测试 44: 跨重启审计持久化 ======
+        r44 = TestResult("测试44: 重启后审计日志完整保留，可正常查询")
+        results.append(r44)
+        try:
+            svc_restart_audit = PipelineService(db_path)
+
+            restart_audit_bid = svc_restart_audit.create_batch("restart_audit", SAMPLE_CSV)
+            svc_restart_audit.process_batch(restart_audit_bid)
+            restart_audit_sid = svc_restart_audit.save_scheme("restart_audit_scheme", batch_id=restart_audit_bid)
+            svc_restart_audit.apply_scheme_to_batch(restart_audit_sid, restart_audit_bid)
+            svc_restart_audit.dry_run_apply_scheme(restart_audit_sid, restart_audit_bid)
+
+            before_logs = svc_restart_audit.get_scheme_audit_logs(batch_id=restart_audit_bid)
+            before_count = len(before_logs)
+            assert before_count >= 2, "重启前应有至少 2 条审计记录（apply + dry_run）"
+
+            del svc_restart_audit
+
+            svc_restart_audit2 = PipelineService(db_path)
+
+            after_logs = svc_restart_audit2.get_scheme_audit_logs(batch_id=restart_audit_bid)
+            after_count = len(after_logs)
+            assert after_count == before_count, f"重启后审计记录数应不变，before={before_count}, after={after_count}"
+
+            apply_log = [l for l in after_logs if l["action"] == "apply"]
+            assert len(apply_log) == 1, "重启后 apply 记录仍存在"
+            assert apply_log[0]["result"] == "success"
+
+            dryrun_log = [l for l in after_logs if l["action"] == "dry_run"]
+            assert len(dryrun_log) == 1, "重启后 dry_run 记录仍存在"
+
+            r44.ok()
+            print(f"  [PASS] {r44.name}  (audit_count={after_count}, persist_ok)")
+        except Exception as e:
+            r44.fail(str(e))
+            print(f"  [FAIL] {r44.name}: {e}")
+
+        # ====== 测试 45: CLI dry-run / audit-history 输出对齐 ======
+        r45 = TestResult("测试45: CLI scheme dry-run / audit-history 命令输出与 README 文档对齐")
+        results.append(r45)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+            import logging
+
+            runner = CliRunner()
+            svc_cli3 = PipelineService(db_path)
+
+            cli_dry_bid = svc_cli3.create_batch("cli_dry_batch", SAMPLE_CSV)
+            svc_cli3.process_batch(cli_dry_bid)
+            cli_dry_sid = svc_cli3.save_scheme("cli_dry_scheme", batch_id=cli_dry_bid)
+
+            res_help1 = runner.invoke(cli, ["scheme", "--help"])
+            assert "dry-run" in res_help1.output, "scheme --help 应包含 dry-run"
+            assert "audit-history" in res_help1.output, "scheme --help 应包含 audit-history"
+
+            res_dry_help = runner.invoke(cli, ["scheme", "dry-run", "--help"])
+            assert res_dry_help.exit_code == 0
+            assert "SCHEME_ID" in res_dry_help.output
+            assert "BATCH_ID" in res_dry_help.output
+            assert "--new-name" in res_dry_help.output
+            assert "--source-scheme-id" in res_dry_help.output
+
+            res_audit_help = runner.invoke(cli, ["scheme", "audit-history", "--help"])
+            assert res_audit_help.exit_code == 0
+            assert "BATCH_ID" in res_audit_help.output
+            assert "--scheme-id" in res_audit_help.output
+            assert "--action" in res_audit_help.output
+            assert "--result" in res_audit_help.output
+            assert "--diff" in res_audit_help.output
+
+            res_dry_ok = runner.invoke(cli, ["--db", db_path, "scheme", "dry-run",
+                                             str(cli_dry_sid), str(cli_dry_bid)])
+            assert res_dry_ok.exit_code == 0, f"dry-run 成功应 exit=0，实际 {res_dry_ok.exit_code}"
+            assert "[OK]" in res_dry_ok.output, "dry-run 成功输出应包含 [OK]"
+            assert "Dry-Run 检查结果" in res_dry_ok.output, "输出应包含标题"
+            assert "目标批次" in res_dry_ok.output, "输出应包含目标批次"
+            assert "待应用方案" in res_dry_ok.output, "输出应包含待应用方案"
+            assert "风险数量" in res_dry_ok.output, "输出应包含风险数量"
+            assert "配置变更预览" in res_dry_ok.output, "预检成功应包含配置变更预览"
+            assert "版本变化" in res_dry_ok.output, "应包含版本变化"
+
+            svc_cli3.lock_batch(cli_dry_bid)
+            res_dry_blocked = runner.invoke(cli, ["--db", db_path, "scheme", "dry-run",
+                                                  str(cli_dry_sid), str(cli_dry_bid)])
+            assert res_dry_blocked.exit_code != 0, "dry-run 阻止应 exit!=0"
+            assert "[ERROR]" in res_dry_blocked.output, "阻止输出应包含 [ERROR]"
+            assert "检查未通过" in res_dry_blocked.output, "应说明检查未通过"
+            assert "风险详情" in res_dry_blocked.output, "应包含风险详情"
+            assert "锁定" in res_dry_blocked.output, "应说明锁定原因"
+
+            svc_cli3.unlock_batch(cli_dry_bid)
+            svc_cli3.apply_scheme_to_batch(cli_dry_sid, cli_dry_bid)
+
+            res_audit = runner.invoke(cli, ["--db", db_path, "scheme", "audit-history",
+                                            str(cli_dry_bid)])
+            assert res_audit.exit_code == 0
+            assert "ID" in res_audit.output
+            assert "时间" in res_audit.output
+            assert "操作" in res_audit.output
+            assert "触发" in res_audit.output
+            assert "批次" in res_audit.output
+            assert "方案" in res_audit.output
+            assert "结果" in res_audit.output
+
+            res_audit_diff = runner.invoke(cli, ["--db", db_path, "scheme", "audit-history",
+                                                 str(cli_dry_bid), "--diff"])
+            assert res_audit_diff.exit_code == 0
+            assert "配置差异详情" in res_audit_diff.output, "--diff 应显示配置差异"
+
+            res_audit_filter = runner.invoke(cli, ["--db", db_path, "scheme", "audit-history",
+                                                   str(cli_dry_bid), "--result", "success",
+                                                   "--action", "apply"])
+            assert res_audit_filter.exit_code == 0
+
+            r45.ok()
+            print(f"  [PASS] {r45.name}  (CLI help + success + blocked + audit 全部对齐)")
+        except Exception as e:
+            r45.fail(str(e))
+            print(f"  [FAIL] {r45.name}: {e}")
 
         # ====== 汇总 ======
         print()

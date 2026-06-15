@@ -92,6 +92,8 @@ python -m pipeline scheme --help
 | `scheme derive-apply SOURCE_SCHEME_ID NEW_NAME BATCH_ID [--description TEXT]` | 派生方案并立即应用到未锁定批次，7步校验+步骤级日志 |
 | `scheme history BATCH_ID` | 查看批次的方案应用/回滚历史记录 |
 | `scheme rollback BATCH_ID` | 回滚批次到上一个配置版本（撤销最近一次方案应用或修改） |
+| `scheme dry-run SCHEME_ID BATCH_ID [--new-name NAME] [--source-scheme-id N]` | 预检查方案应用风险（不实际执行） |
+| `scheme audit-history [BATCH_ID] [--scheme-id N] [--action TYPE] [--result TYPE] [--limit N] [--diff]` | 查看方案应用审计历史（含配置差异、结果、失败原因） |
 | `scheme export SCHEME_ID -o FILE.json` | 导出方案为 JSON 文件 |
 | `scheme import FILE.json [--on-conflict ask\|overwrite\|rename\|skip] [--new-name NAME]` | 从文件导入方案 |
 | `scheme delete SCHEME_ID` | 删除方案 |
@@ -192,11 +194,12 @@ python -m pipeline compare --help
 
 所有数据存储在 SQLite 数据库中（默认 `pipeline.db`，可用 `--db PATH` 指定）：
 
-- `batches`: 批次元数据和配置
+- `batches`: 批次元数据和配置（含当前方案信息）
 - `runs`: 运行记录（含配置快照）
 - `row_errors`/`metrics`/`anomalies`: 处理结果明细
 - `exports`: 导出记录
-- `analysis_schemes`: 命名分析方案
+- `analysis_schemes`: 命名分析方案（含来源方案追溯）
+- `batch_scheme_history`: 批次方案应用/回滚历史记录
 - `comparison_reports`: 对比报告快照
 
 ## 日志

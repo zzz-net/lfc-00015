@@ -123,6 +123,51 @@ class SchemeRollbackResult:
         self.message = message
 
 
+class DryRunRisk:
+    """Dry-run 风险类型"""
+    RISK_LOCKED = "batch_locked"
+    RISK_NAME_CONFLICT = "name_conflict"
+    RISK_SOURCE_MISSING = "source_missing"
+    RISK_VERSION_MISMATCH = "version_mismatch"
+    RISK_CONFIG_INCOMPLETE = "config_incomplete"
+    RISK_BATCH_NOT_FOUND = "batch_not_found"
+    RISK_SCHEME_NOT_FOUND = "scheme_not_found"
+
+    SEVERITY_BLOCKER = "blocker"
+    SEVERITY_WARNING = "warning"
+
+    def __init__(self, risk_type: str, severity: str, message: str, details: Dict[str, Any] = None):
+        self.risk_type = risk_type
+        self.severity = severity
+        self.message = message
+        self.details = details or {}
+
+
+class DryRunResult:
+    """Dry-run 检查结果"""
+
+    def __init__(self, can_proceed: bool, risks: List[DryRunRisk] = None,
+                 scheme_id: int = None, scheme_name: str = None,
+                 batch_id: int = None, source_scheme_id: int = None,
+                 previous_config: Dict[str, Any] = None,
+                 new_config: Dict[str, Any] = None,
+                 config_diff: Dict[str, Any] = None):
+        self.can_proceed = can_proceed
+        self.risks = risks or []
+        self.scheme_id = scheme_id
+        self.scheme_name = scheme_name
+        self.batch_id = batch_id
+        self.source_scheme_id = source_scheme_id
+        self.previous_config = previous_config
+        self.new_config = new_config
+        self.config_diff = config_diff
+
+
+class SchemeAuditLogResult:
+    """方案审计日志查询结果"""
+    pass
+
+
 class PipelineService:
     """流水线服务类"""
 
@@ -590,27 +635,51 @@ class PipelineService:
         finally:
             conn.close()
 
-    def apply_scheme_to_batch(self, scheme_id: int, batch_id: int) -> Dict[str, Any]:
+    def apply_scheme_to_batch(self, scheme_id: int, batch_id: int,
+                               trigger_method: str = db.AUDIT_TRIGGER_CLI) -> Dict[str, Any]:
         """
         将方案配置应用到批次（返回新配置，不自动重跑）。
         锁定批次不允许修改配置。
         记录应用历史，更新批次当前方案信息。
+        记录完整审计日志（配置差异、触发方式、结果）。
         """
         conn = self._conn()
         try:
             scheme = db.get_scheme(conn, scheme_id)
             if not scheme:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    scheme_id=scheme_id, error_message=f"方案不存在: {scheme_id}"
+                )
                 raise SchemeError(f"方案不存在: {scheme_id}")
             batch = db.get_batch(conn, batch_id)
             if not batch:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    scheme_id=scheme_id, scheme_name=scheme["name"],
+                    error_message=f"批次不存在: {batch_id}"
+                )
                 raise BatchServiceError(f"批次不存在: {batch_id}")
+            previous_config = json.loads(batch["config_json"])
+
             if db.is_batch_locked(conn, batch_id):
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_BLOCKED,
+                    scheme_id=scheme_id, scheme_name=scheme["name"],
+                    previous_config=previous_config,
+                    error_message=f"批次 {batch_id} 已锁定"
+                )
                 raise BatchLockedError(
                     f"批次 {batch_id} 已锁定，无法应用新方案。"
                     f"如需使用该方案进行对比分析，请使用 compare 命令直接生成报告，"
                     f"而不要修改已锁定批次的历史配置。"
                 )
             new_cfg = bump_config_version(scheme["config"])
+            config_diff = db.compute_config_diff(previous_config, new_cfg)
+
             db.update_batch_config(conn, batch_id, new_cfg,
                                    scheme_id=scheme_id, scheme_name=scheme["name"])
 
@@ -620,6 +689,16 @@ class PipelineService:
                 scheme_id=scheme_id, scheme_name=scheme["name"],
                 source_scheme_id=scheme.get("source_scheme_id")
             )
+
+            db.add_scheme_audit_log(
+                conn, batch_id=batch_id, action=db.AUDIT_ACTION_APPLY,
+                trigger_method=trigger_method, result=db.AUDIT_RESULT_SUCCESS,
+                scheme_id=scheme_id, scheme_name=scheme["name"],
+                source_scheme_id=scheme.get("source_scheme_id"),
+                previous_config=previous_config, new_config=new_cfg,
+                config_diff=config_diff
+            )
+
             logger.info(
                 f"方案已应用到批次: scheme_id={scheme_id}, scheme_name='{scheme['name']}', "
                 f"batch_id={batch_id}, new_config_version={new_cfg['version']}, "
@@ -637,6 +716,27 @@ class PipelineService:
             if not batch:
                 raise BatchServiceError(f"批次不存在: {batch_id}")
             return db.get_scheme_history(conn, batch_id)
+        finally:
+            conn.close()
+
+    def get_scheme_audit_logs(self, batch_id: int = None, scheme_id: int = None,
+                             action: str = None, result: str = None,
+                             limit: int = 100) -> List[Dict[str, Any]]:
+        """查询方案审计日志，支持按批次、方案、操作类型、结果筛选"""
+        conn = self._conn()
+        try:
+            return db.get_scheme_audit_logs(
+                conn, batch_id=batch_id, scheme_id=scheme_id,
+                action=action, result=result, limit=limit
+            )
+        finally:
+            conn.close()
+
+    def get_scheme_by_original_id(self, original_id: int) -> Optional[Dict[str, Any]]:
+        """通过原始方案 ID 查找导入的方案（用于导入导出后的历史连续性）"""
+        conn = self._conn()
+        try:
+            return db.get_scheme_by_original_id(conn, original_id)
         finally:
             conn.close()
 
@@ -766,25 +866,45 @@ class PipelineService:
             conn.close()
 
     def clone_and_apply_scheme(self, source_scheme_id: int, new_name: str,
-                               batch_id: int, new_description: str = None) -> SchemeCloneResult:
+                               batch_id: int, new_description: str = None,
+                               trigger_method: str = db.AUDIT_TRIGGER_CLI) -> SchemeCloneResult:
         """
         克隆方案并立即应用到指定批次。
         步骤：
         1. 克隆源方案为新方案（含冲突检测）
         2. 将新方案应用到批次（含锁定批次保护）
         3. 返回克隆结果（含新方案 ID、批次新配置版本等）
+        记录完整审计日志。
         """
         conn = self._conn()
         try:
             source = db.get_scheme(conn, source_scheme_id)
             if not source:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_CLONE_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    source_scheme_id=source_scheme_id,
+                    error_message=f"源方案不存在: {source_scheme_id}"
+                )
                 raise SchemeError(f"源方案不存在: {source_scheme_id}")
 
             batch = db.get_batch(conn, batch_id)
             if not batch:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_CLONE_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    source_scheme_id=source_scheme_id,
+                    error_message=f"批次不存在: {batch_id}"
+                )
                 raise BatchServiceError(f"批次不存在: {batch_id}")
 
             if db.is_batch_locked(conn, batch_id):
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_CLONE_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_BLOCKED,
+                    source_scheme_id=source_scheme_id,
+                    error_message=f"批次 {batch_id} 已锁定"
+                )
                 raise BatchLockedError(
                     f"批次 {batch_id} 已锁定，无法应用克隆方案。"
                     f"如需使用该方案进行对比分析，请使用 compare 命令直接生成报告，"
@@ -793,6 +913,12 @@ class PipelineService:
 
             existing = db.get_scheme_by_name(conn, new_name)
             if existing:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_CLONE_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_BLOCKED,
+                    source_scheme_id=source_scheme_id,
+                    error_message=f"方案名称已存在: '{new_name}'"
+                )
                 raise SchemeConflictError(
                     SchemeConflictError.CONFLICT_NAME,
                     f"方案名称已存在: '{new_name}'",
@@ -808,6 +934,12 @@ class PipelineService:
 
             valid, missing = db.validate_scheme_config(config)
             if not valid:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_CLONE_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    source_scheme_id=source_scheme_id,
+                    error_message=f"源方案配置缺少必填字段: {', '.join(missing)}"
+                )
                 raise SchemeConflictError(
                     SchemeConflictError.CONFLICT_MISSING_FIELDS,
                     f"源方案配置缺少必填字段: {', '.join(missing)}",
@@ -820,7 +952,10 @@ class PipelineService:
                 f"cloned_id={cloned_id}, cloned_name='{new_name}'"
             )
 
+            previous_config = json.loads(batch["config_json"])
             new_cfg = bump_config_version(config)
+            config_diff = db.compute_config_diff(previous_config, new_cfg)
+
             db.update_batch_config(conn, batch_id, new_cfg,
                                    scheme_id=cloned_id, scheme_name=new_name)
 
@@ -830,6 +965,16 @@ class PipelineService:
                 scheme_id=cloned_id, scheme_name=new_name,
                 source_scheme_id=source_scheme_id
             )
+
+            db.add_scheme_audit_log(
+                conn, batch_id=batch_id, action=db.AUDIT_ACTION_CLONE_APPLY,
+                trigger_method=trigger_method, result=db.AUDIT_RESULT_SUCCESS,
+                scheme_id=cloned_id, scheme_name=new_name,
+                source_scheme_id=source_scheme_id,
+                previous_config=previous_config, new_config=new_cfg,
+                config_diff=config_diff
+            )
+
             logger.info(
                 f"克隆方案已应用到批次: scheme_id={cloned_id}, scheme_name='{new_name}', "
                 f"batch_id={batch_id}, new_config_version={new_cfg['version']}, "
@@ -923,15 +1068,23 @@ class PipelineService:
             conn.close()
 
     def derive_and_apply_scheme(self, source_scheme_id: int, new_name: str,
-                                batch_id: int, new_description: str = None) -> SchemeDeriveResult:
+                                batch_id: int, new_description: str = None,
+                                trigger_method: str = db.AUDIT_TRIGGER_CLI) -> SchemeDeriveResult:
         """
         派生方案并立即应用到指定批次。步骤级校验 + 日志，失败时记录 failed_step。
         校验顺序：源方案 → 批次存在 → 批次未锁定 → 名称不冲突 → 配置完整 → 创建方案 → 应用
+        记录完整审计日志。
         """
         conn = self._conn()
         try:
             source = db.get_scheme(conn, source_scheme_id)
             if not source:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_DERIVE_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    source_scheme_id=source_scheme_id,
+                    error_message=f"源方案不存在: {source_scheme_id}"
+                )
                 logger.info(
                     f"派生并应用失败(步骤1-校验源方案): source_id={source_scheme_id}, "
                     f"batch_id={batch_id}, result=源方案不存在"
@@ -944,6 +1097,12 @@ class PipelineService:
 
             batch = db.get_batch(conn, batch_id)
             if not batch:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_DERIVE_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    source_scheme_id=source_scheme_id,
+                    error_message=f"批次不存在: {batch_id}"
+                )
                 logger.info(
                     f"派生并应用失败(步骤2-校验批次): source_id={source_scheme_id}, "
                     f"batch_id={batch_id}, result=批次不存在"
@@ -954,6 +1113,12 @@ class PipelineService:
             )
 
             if db.is_batch_locked(conn, batch_id):
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_DERIVE_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_BLOCKED,
+                    source_scheme_id=source_scheme_id,
+                    error_message=f"批次 {batch_id} 已锁定"
+                )
                 logger.info(
                     f"派生并应用失败(步骤3-校验锁定): source_id={source_scheme_id}, "
                     f"batch_id={batch_id}, result=批次已锁定"
@@ -969,6 +1134,12 @@ class PipelineService:
 
             existing = db.get_scheme_by_name(conn, new_name)
             if existing:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_DERIVE_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_BLOCKED,
+                    source_scheme_id=source_scheme_id,
+                    error_message=f"方案名称已存在: '{new_name}'"
+                )
                 logger.info(
                     f"派生并应用失败(步骤4-校验名称冲突): source_id={source_scheme_id}, "
                     f"new_name='{new_name}', result=名称已存在(existing_id={existing['id']})"
@@ -991,6 +1162,12 @@ class PipelineService:
 
             valid, missing = db.validate_scheme_config(config)
             if not valid:
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_DERIVE_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_FAILED,
+                    source_scheme_id=source_scheme_id,
+                    error_message=f"源方案配置缺少必填字段: {', '.join(missing)}"
+                )
                 logger.info(
                     f"派生并应用失败(步骤5-校验配置): source_id={source_scheme_id}, "
                     f"result=缺少必填字段({', '.join(missing)})"
@@ -1012,7 +1189,10 @@ class PipelineService:
                 f"derived_name='{new_name}', result=成功"
             )
 
+            previous_config = json.loads(batch["config_json"])
             new_cfg = bump_config_version(config)
+            config_diff = db.compute_config_diff(previous_config, new_cfg)
+
             db.update_batch_config(conn, batch_id, new_cfg,
                                    scheme_id=derived_id, scheme_name=new_name)
 
@@ -1022,6 +1202,16 @@ class PipelineService:
                 scheme_id=derived_id, scheme_name=new_name,
                 source_scheme_id=source_scheme_id
             )
+
+            db.add_scheme_audit_log(
+                conn, batch_id=batch_id, action=db.AUDIT_ACTION_DERIVE_APPLY,
+                trigger_method=trigger_method, result=db.AUDIT_RESULT_SUCCESS,
+                scheme_id=derived_id, scheme_name=new_name,
+                source_scheme_id=source_scheme_id,
+                previous_config=previous_config, new_config=new_cfg,
+                config_diff=config_diff
+            )
+
             logger.info(
                 f"派生并应用步骤7-应用到批次: derived_id={derived_id}, "
                 f"derived_name='{new_name}', batch_id={batch_id}, "
@@ -1041,6 +1231,146 @@ class PipelineService:
         finally:
             conn.close()
 
+    def dry_run_apply_scheme(self, scheme_id: int, batch_id: int,
+                             new_scheme_name: str = None,
+                             source_scheme_id: int = None) -> DryRunResult:
+        """
+        预检查方案应用风险，不实际修改任何数据。
+        检查项：
+        1. 批次是否存在
+        2. 方案是否存在
+        3. 批次是否锁定
+        4. 新方案名称是否冲突（如果指定了 new_scheme_name）
+        5. 源方案是否存在（如果指定了 source_scheme_id）
+        6. 方案版本是否兼容
+        7. 方案配置是否完整
+        """
+        conn = self._conn()
+        try:
+            risks: List[DryRunRisk] = []
+            can_proceed = True
+
+            batch = db.get_batch(conn, batch_id)
+            if not batch:
+                risks.append(DryRunRisk(
+                    DryRunRisk.RISK_BATCH_NOT_FOUND,
+                    DryRunRisk.SEVERITY_BLOCKER,
+                    f"批次不存在: {batch_id}",
+                    {"batch_id": batch_id}
+                ))
+                can_proceed = False
+
+            scheme = db.get_scheme(conn, scheme_id)
+            if not scheme:
+                risks.append(DryRunRisk(
+                    DryRunRisk.RISK_SCHEME_NOT_FOUND,
+                    DryRunRisk.SEVERITY_BLOCKER,
+                    f"方案不存在: {scheme_id}",
+                    {"scheme_id": scheme_id}
+                ))
+                can_proceed = False
+
+            if batch and db.is_batch_locked(conn, batch_id):
+                risks.append(DryRunRisk(
+                    DryRunRisk.RISK_LOCKED,
+                    DryRunRisk.SEVERITY_BLOCKER,
+                    f"批次 {batch_id} 已锁定，无法应用方案",
+                    {"batch_id": batch_id, "batch_name": batch.get("name")}
+                ))
+                can_proceed = False
+
+            if new_scheme_name:
+                existing = db.get_scheme_by_name(conn, new_scheme_name)
+                if existing:
+                    risks.append(DryRunRisk(
+                        DryRunRisk.RISK_NAME_CONFLICT,
+                        DryRunRisk.SEVERITY_BLOCKER,
+                        f"方案名称已存在: '{new_scheme_name}'",
+                        {
+                            "new_name": new_scheme_name,
+                            "existing_scheme_id": existing["id"],
+                            "existing_scheme_name": existing["name"]
+                        }
+                    ))
+                    can_proceed = False
+
+            if source_scheme_id:
+                source = db.get_scheme(conn, source_scheme_id)
+                if not source:
+                    risks.append(DryRunRisk(
+                        DryRunRisk.RISK_SOURCE_MISSING,
+                        DryRunRisk.SEVERITY_BLOCKER,
+                        f"源方案不存在: {source_scheme_id}",
+                        {"source_scheme_id": source_scheme_id}
+                    ))
+                    can_proceed = False
+
+            if scheme:
+                version_ok, version_msg = db.check_scheme_version_compatibility(scheme["scheme_version"])
+                if not version_ok:
+                    risks.append(DryRunRisk(
+                        DryRunRisk.RISK_VERSION_MISMATCH,
+                        DryRunRisk.SEVERITY_WARNING,
+                        f"方案版本不兼容: {version_msg}",
+                        {
+                            "scheme_version": scheme["scheme_version"],
+                            "current_version": db.SCHEME_VERSION
+                        }
+                    ))
+
+                valid, missing = db.validate_scheme_config(scheme["config"])
+                if not valid:
+                    risks.append(DryRunRisk(
+                        DryRunRisk.RISK_CONFIG_INCOMPLETE,
+                        DryRunRisk.SEVERITY_BLOCKER,
+                        f"方案配置缺少必填字段: {', '.join(missing)}",
+                        {"missing_fields": missing}
+                    ))
+                    can_proceed = False
+
+            previous_config = None
+            new_config = None
+            config_diff = None
+
+            if batch and scheme:
+                previous_config = json.loads(batch["config_json"])
+                new_config = bump_config_version(scheme["config"])
+                config_diff = db.compute_config_diff(previous_config, new_config)
+
+            db.add_scheme_audit_log(
+                conn,
+                batch_id=batch_id,
+                action=db.AUDIT_ACTION_DRY_RUN,
+                trigger_method=db.AUDIT_TRIGGER_CLI,
+                result=db.AUDIT_RESULT_SUCCESS if can_proceed else db.AUDIT_RESULT_BLOCKED,
+                scheme_id=scheme_id,
+                scheme_name=scheme["name"] if scheme else None,
+                source_scheme_id=source_scheme_id,
+                previous_config=previous_config,
+                new_config=new_config,
+                config_diff=config_diff,
+                error_message=None if can_proceed else "Dry-run 检测到风险，操作被阻止"
+            )
+
+            logger.info(
+                f"Dry-run 完成: batch_id={batch_id}, scheme_id={scheme_id}, "
+                f"can_proceed={can_proceed}, risks_count={len(risks)}"
+            )
+
+            return DryRunResult(
+                can_proceed=can_proceed,
+                risks=risks,
+                scheme_id=scheme_id,
+                scheme_name=scheme["name"] if scheme else None,
+                batch_id=batch_id,
+                source_scheme_id=source_scheme_id,
+                previous_config=previous_config,
+                new_config=new_config,
+                config_diff=config_diff
+            )
+        finally:
+            conn.close()
+
     def export_scheme_to_file(self, scheme_id: int, file_path: str) -> str:
         """将方案导出为 JSON 文件"""
         conn = self._conn()
@@ -1054,6 +1384,7 @@ class PipelineService:
                 "scheme_version": scheme["scheme_version"],
                 "config": scheme["config"],
                 "source_scheme_id": scheme.get("source_scheme_id"),
+                "original_id": scheme.get("original_id") or scheme_id,
                 "exported_at": datetime.now().isoformat()
             }
             os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
@@ -1069,6 +1400,7 @@ class PipelineService:
         """
         从 JSON 文件导入方案。
         on_conflict: overwrite / rename / skip (None 时抛出异常让调用方处理)
+        导入时保留 original_id（导出时的原始 ID）用于历史追溯
         """
         if not os.path.exists(file_path):
             raise SchemeError(f"方案文件不存在: {file_path}")
@@ -1085,6 +1417,9 @@ class PipelineService:
             raise SchemeError("导入文件缺少 'config' 字段")
 
         imported_version = data.get("scheme_version", "0.0")
+        original_id = data.get("original_id")
+        exported_at = data.get("exported_at")
+
         version_ok, version_msg = db.check_scheme_version_compatibility(imported_version)
         if not version_ok:
             if on_conflict is None:
@@ -1114,6 +1449,8 @@ class PipelineService:
 
         description = data.get("description")
         source_scheme_id = data.get("source_scheme_id")
+        imported_from = f"{file_path}@{exported_at}" if exported_at else file_path
+
         conn = self._conn()
         try:
             existing = db.get_scheme_by_name(conn, name)
@@ -1138,10 +1475,12 @@ class PipelineService:
                         final_name = f"{name}_imported_{counter}"
                         counter += 1
                     sid = db.create_scheme(conn, final_name, config, description,
-                                           source_scheme_id=source_scheme_id)
+                                           source_scheme_id=source_scheme_id,
+                                           original_id=original_id,
+                                           imported_from=imported_from)
                     result = SchemeImportResult(True, sid, SchemeImportResult.ACTION_RENAME,
                                                 f"已重命名导入: '{final_name}'")
-                    logger.info(f"方案导入(重命名): file='{file_path}', scheme_id={sid}, original='{name}', final='{final_name}'")
+                    logger.info(f"方案导入(重命名): file='{file_path}', scheme_id={sid}, original='{name}', final='{final_name}', original_id={original_id}")
                     return result
                 elif on_conflict == SchemeImportResult.ACTION_SKIP:
                     result = SchemeImportResult(False, None, SchemeImportResult.ACTION_SKIP,
@@ -1152,9 +1491,11 @@ class PipelineService:
                     raise SchemeError(f"未知冲突处理策略: {on_conflict}")
             else:
                 sid = db.create_scheme(conn, name, config, description,
-                                       source_scheme_id=source_scheme_id)
+                                       source_scheme_id=source_scheme_id,
+                                       original_id=original_id,
+                                       imported_from=imported_from)
                 result = SchemeImportResult(True, sid, None, f"已导入方案 '{name}'")
-                logger.info(f"方案导入: file='{file_path}', scheme_id={sid}, name='{name}'")
+                logger.info(f"方案导入: file='{file_path}', scheme_id={sid}, name='{name}', original_id={original_id}")
                 return result
         finally:
             conn.close()

@@ -8,7 +8,7 @@ from tabulate import tabulate
 from .service import (
     PipelineService, BatchServiceError, BatchLockedError,
     SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult,
-    SchemeDeriveResult
+    SchemeDeriveResult, DryRunResult, DryRunRisk
 )
 from .config import get_default_config, load_config
 
@@ -700,6 +700,178 @@ def scheme_rollback(ctx, batch_id):
     except BatchLockedError as e:
         click.echo(f"{ERR} {e}", err=True)
         sys.exit(1)
+    except BatchServiceError as e:
+        click.echo(f"{ERR} 批次错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("dry-run")
+@click.argument("scheme_id", type=int)
+@click.argument("batch_id", type=int)
+@click.option("--new-name", default=None, help="新方案名称（用于 clone-apply/derive-apply 场景的预检）")
+@click.option("--source-scheme-id", type=int, default=None, help="源方案 ID（用于 clone-apply/derive-apply 场景的预检）")
+@click.pass_context
+def scheme_dry_run(ctx, scheme_id, batch_id, new_name, source_scheme_id):
+    """预检查方案应用风险，不实际修改任何数据。
+
+    检查项：批次存在、方案存在、批次未锁定、新名称不冲突、源方案存在、版本兼容、配置完整。
+    返回能否继续执行及具体原因。
+    结果会记录到审计日志中，可通过 audit-history 查询。
+    日志位置：Logger=pipeline.service，级别=INFO。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.dry_run_apply_scheme(
+            scheme_id=scheme_id,
+            batch_id=batch_id,
+            new_scheme_name=new_name,
+            source_scheme_id=source_scheme_id
+        )
+
+        click.echo(f"=== Dry-Run 检查结果 ===")
+        click.echo(f"  目标批次:   #{batch_id}")
+        click.echo(f"  待应用方案: #{scheme_id}" + (f" '{result.scheme_name}'" if result.scheme_name else ""))
+        if source_scheme_id:
+            click.echo(f"  源方案:     #{source_scheme_id}")
+        if new_name:
+            click.echo(f"  新方案名:   '{new_name}'")
+        click.echo()
+
+        if result.can_proceed:
+            click.echo(f"{OK} 检查通过，可以继续执行")
+        else:
+            click.echo(f"{ERR} 检查未通过，无法继续执行", err=True)
+
+        click.echo(f"  风险数量: {len(result.risks)}")
+        if result.risks:
+            click.echo("\n--- 风险详情 ---")
+            for i, risk in enumerate(result.risks, 1):
+                severity_label = "阻止" if risk.severity == DryRunRisk.SEVERITY_BLOCKER else "警告"
+                click.echo(f"  {i}. [{severity_label}] {risk.risk_type}: {risk.message}")
+                if risk.details:
+                    for k, v in risk.details.items():
+                        click.echo(f"     {k}: {v}")
+
+        if result.config_diff and result.can_proceed:
+            click.echo("\n--- 配置变更预览 ---")
+            cd = result.config_diff
+            if cd.get("version_change"):
+                click.echo(f"  版本变化: v{cd['version_change']['old']} → v{cd['version_change']['new']}")
+            if cd.get("added"):
+                click.echo(f"  新增字段 ({len(cd['added'])}):")
+                for k, v in cd["added"].items():
+                    click.echo(f"    + {k} = {v}")
+            if cd.get("modified"):
+                click.echo(f"  修改字段 ({len(cd['modified'])}):")
+                for k, v in cd["modified"].items():
+                    click.echo(f"    ~ {k}: {v['old']} → {v['new']}")
+            if cd.get("removed"):
+                click.echo(f"  删除字段 ({len(cd['removed'])}):")
+                for k, v in cd["removed"].items():
+                    click.echo(f"    - {k} = {v}")
+
+        click.echo()
+        if not result.can_proceed:
+            sys.exit(1)
+
+    except (SchemeError, BatchServiceError) as e:
+        click.echo(f"{ERR} 错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("audit-history")
+@click.argument("batch_id", type=int, required=False)
+@click.option("--scheme-id", type=int, default=None, help="按方案 ID 筛选")
+@click.option("--action", type=click.Choice(["apply", "clone_apply", "derive_apply", "rollback", "direct_modify", "dry_run"]), default=None, help="按操作类型筛选")
+@click.option("--result", type=click.Choice(["success", "failed", "blocked"]), default=None, help="按结果筛选")
+@click.option("--limit", type=int, default=50, help="最多显示条数（默认 50）")
+@click.option("--diff", is_flag=True, help="显示配置差异详情")
+@click.pass_context
+def scheme_audit_history(ctx, batch_id, scheme_id, action, result, limit, diff):
+    """查看方案应用审计历史。
+
+    可按批次、方案、操作类型、执行结果筛选。
+    每条记录包含：操作类型、触发方式、前后配置、差异、结果、失败原因。
+    数据持久化在数据库中，重启后仍可查询。
+    导入导出后的方案继续应用时，历史记录保持连续。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        logs = svc.get_scheme_audit_logs(
+            batch_id=batch_id,
+            scheme_id=scheme_id,
+            action=action,
+            result=result,
+            limit=limit
+        )
+
+        if not logs:
+            click.echo("(暂无审计记录)")
+            return
+
+        action_labels = {
+            "apply": "应用",
+            "clone_apply": "克隆应用",
+            "derive_apply": "派生应用",
+            "rollback": "回滚",
+            "direct_modify": "直接修改",
+            "dry_run": "预检"
+        }
+        result_labels = {
+            "success": "成功",
+            "failed": "失败",
+            "blocked": "阻止"
+        }
+        trigger_labels = {
+            "cli": "CLI",
+            "api": "API",
+            "import": "导入"
+        }
+
+        rows = []
+        for log in logs:
+            scheme_info = ""
+            if log.get("scheme_id"):
+                scheme_info = f"#{log['scheme_id']}"
+                if log.get("scheme_name"):
+                    scheme_info += f" {log['scheme_name']}"
+            source_info = ""
+            if log.get("source_scheme_id"):
+                source_info = f"#{log['source_scheme_id']}"
+
+            result_label = result_labels.get(log["result"], log["result"])
+            result_color = "green" if log["result"] == "success" else "red"
+
+            rows.append({
+                "ID": log["id"],
+                "时间": log["created_at"][:19],
+                "操作": action_labels.get(log["action"], log["action"]),
+                "触发": trigger_labels.get(log["trigger_method"], log["trigger_method"]),
+                "批次": f"#{log['batch_id']}",
+                "方案": scheme_info,
+                "来源": source_info,
+                "结果": result_label,
+                "错误": log.get("error_message") or ""
+            })
+
+        _print_table(rows)
+
+        if diff:
+            click.echo("\n=== 配置差异详情 ===")
+            for log in logs:
+                if log.get("config_diff"):
+                    cd = log["config_diff"]
+                    click.echo(f"\n--- 记录 #{log['id']} ({action_labels.get(log['action'], log['action'])}) ---")
+                    if cd.get("version_change"):
+                        click.echo(f"  版本: v{cd['version_change']['old']} → v{cd['version_change']['new']}")
+                    if cd.get("added"):
+                        for k, v in cd["added"].items():
+                            click.echo(f"  + {k} = {v}")
+                    if cd.get("modified"):
+                        for k, v in cd["modified"].items():
+                            click.echo(f"  ~ {k}: {v['old']} → {v['new']}")
+                    if cd.get("removed"):
+                        for k, v in cd["removed"].items():
+                            click.echo(f"  - {k} = {v}")
+
     except BatchServiceError as e:
         click.echo(f"{ERR} 批次错误: {e}", err=True)
         sys.exit(1)
