@@ -99,8 +99,10 @@ def init_db(db_path: str = None) -> None:
                 description TEXT,
                 scheme_version TEXT NOT NULL,
                 config_json TEXT NOT NULL,
+                source_scheme_id INTEGER,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (source_scheme_id) REFERENCES analysis_schemes(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS comparison_reports (
@@ -127,6 +129,16 @@ def init_db(db_path: str = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_comparison_reports_scheme_id ON comparison_reports(scheme_id);
         """)
         conn.commit()
+
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(analysis_schemes)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "source_scheme_id" not in columns:
+            cursor.execute(
+                "ALTER TABLE analysis_schemes ADD COLUMN source_scheme_id INTEGER "
+                "REFERENCES analysis_schemes(id) ON DELETE SET NULL"
+            )
+            conn.commit()
     finally:
         conn.close()
 
@@ -342,15 +354,15 @@ REQUIRED_SCHEME_FIELDS = {"cleaning", "missing_values", "anomaly_detection", "me
 
 
 def create_scheme(conn: sqlite3.Connection, name: str, config: Dict[str, Any],
-                  description: str = None) -> int:
+                  description: str = None, source_scheme_id: int = None) -> int:
     """创建新分析方案，返回方案 ID"""
     now = datetime.now().isoformat()
     config_json = json.dumps(config, ensure_ascii=False)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO analysis_schemes (name, description, scheme_version, config_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (name, description, SCHEME_VERSION, config_json, now, now))
+        INSERT INTO analysis_schemes (name, description, scheme_version, config_json, source_scheme_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (name, description, SCHEME_VERSION, config_json, source_scheme_id, now, now))
     conn.commit()
     return cursor.lastrowid
 
@@ -401,7 +413,7 @@ def get_scheme_by_name(conn: sqlite3.Connection, name: str) -> Optional[Dict[str
 def list_schemes(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     """列出所有分析方案（不含 config 详情，节省内存）"""
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, description, scheme_version, created_at, updated_at FROM analysis_schemes ORDER BY updated_at DESC")
+    cursor.execute("SELECT id, name, description, scheme_version, source_scheme_id, created_at, updated_at FROM analysis_schemes ORDER BY updated_at DESC")
     return [dict(row) for row in cursor.fetchall()]
 
 

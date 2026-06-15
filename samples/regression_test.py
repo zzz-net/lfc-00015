@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.service import (
     PipelineService, BatchLockedError, BatchServiceError,
-    SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult
+    SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult,
+    SchemeDeriveResult
 )
 from pipeline import database as db
 from pipeline.processor import import_csv
@@ -1136,6 +1137,268 @@ def run_tests():
         except Exception as e:
             r23.fail(str(e))
             print(f"  [FAIL] {r23.name}: {e}")
+
+        # ====== 测试 24: derive 成功派生 + source_scheme_id 追溯 ======
+        r24 = TestResult("测试24: derive 成功派生，source_scheme_id 记录正确，同名冲突抛 name_exists")
+        results.append(r24)
+        try:
+            svc_d1 = PipelineService(db_path)
+
+            d_base_bid = svc_d1.create_batch("derive_base_batch", SAMPLE_CSV)
+            svc_d1.process_batch(d_base_bid)
+            d_source_sid = svc_d1.save_scheme("derive_source", batch_id=d_base_bid, description="派生源方案")
+
+            d_derived_sid = svc_d1.derive_scheme(d_source_sid, "derive_v2", "派生第二版")
+            assert d_derived_sid > d_source_sid
+
+            derived = svc_d1.get_scheme(d_derived_sid)
+            assert derived["name"] == "derive_v2"
+            assert derived["description"] == "派生第二版"
+            assert derived["source_scheme_id"] == d_source_sid, \
+                f"派生方案 source_scheme_id 应为 {d_source_sid}，实际 {derived.get('source_scheme_id')}"
+
+            source_check = svc_d1.get_scheme(d_source_sid)
+            assert source_check.get("source_scheme_id") is None, "原始方案 source_scheme_id 应为 None"
+
+            try:
+                svc_d1.derive_scheme(d_source_sid, "derive_v2")
+                assert False, "同名派生应抛出 SchemeConflictError"
+            except SchemeConflictError as sce:
+                assert sce.conflict_type == SchemeConflictError.CONFLICT_NAME
+                assert sce.details.get("source_scheme_id") == d_source_sid
+
+            scheme_list = svc_d1.list_schemes()
+            derived_in_list = any(s["id"] == d_derived_sid and s.get("source_scheme_id") == d_source_sid
+                                  for s in scheme_list)
+            assert derived_in_list, "list_schemes 应包含派生方案且 source_scheme_id 正确"
+
+            r24.ok()
+            print(f"  [PASS] {r24.name}  (source={d_source_sid}, derived={d_derived_sid})")
+        except Exception as e:
+            r24.fail(str(e))
+            print(f"  [FAIL] {r24.name}: {e}")
+
+        # ====== 测试 25: derive-apply 成功路径 + 步骤级日志 + 同名/锁定拒绝 ======
+        r25 = TestResult("测试25: derive-apply 成功派生应用、同名冲突、锁定批次拒绝、步骤级日志可见")
+        results.append(r25)
+        try:
+            import logging
+
+            svc_d2 = PipelineService(db_path)
+
+            da_base_bid = svc_d2.create_batch("da_base_batch", SAMPLE_CSV)
+            svc_d2.process_batch(da_base_bid)
+            da_source_sid = svc_d2.save_scheme("da_source", batch_id=da_base_bid, description="派生应用源")
+
+            da_target_bid = svc_d2.create_batch("da_target_batch", SAMPLE_CSV)
+            svc_d2.process_batch(da_target_bid)
+
+            log_records = []
+
+            class _CaptureHandler(logging.Handler):
+                def emit(self, record):
+                    log_records.append(record)
+
+            handler = _CaptureHandler()
+            handler.setLevel(logging.DEBUG)
+            svc_logger = logging.getLogger("pipeline.service")
+            original_level = svc_logger.level
+            svc_logger.addHandler(handler)
+            svc_logger.setLevel(logging.INFO)
+
+            try:
+                result = svc_d2.derive_and_apply_scheme(
+                    da_source_sid, "da_derived_applied", da_target_bid, "链路派生方案")
+                assert isinstance(result, SchemeDeriveResult)
+                assert result.success is True
+                assert result.source_scheme_id == da_source_sid
+                assert result.source_scheme_name == "da_source"
+                assert result.derived_scheme_id > da_source_sid
+                assert result.derived_scheme_name == "da_derived_applied"
+                assert result.applied_batch_id == da_target_bid
+                assert result.new_config_version > 1
+                assert result.failed_step is None
+
+                derived_scheme = svc_d2.get_scheme(result.derived_scheme_id)
+                assert derived_scheme["source_scheme_id"] == da_source_sid
+
+                da_msgs = [r.getMessage() for r in log_records if r.levelno == logging.INFO]
+                joined = " | ".join(da_msgs)
+                assert "步骤1-校验源方案" in joined, f"日志应含步骤1，实际: {joined}"
+                assert "步骤2-校验批次" in joined, f"日志应含步骤2，实际: {joined}"
+                assert "步骤3-校验锁定" in joined, f"日志应含步骤3，实际: {joined}"
+                assert "步骤4-校验名称冲突" in joined, f"日志应含步骤4，实际: {joined}"
+                assert "步骤5-校验配置" in joined, f"日志应含步骤5，实际: {joined}"
+                assert "步骤6-创建派生方案" in joined, f"日志应含步骤6，实际: {joined}"
+                assert "步骤7-应用到批次" in joined, f"日志应含步骤7，实际: {joined}"
+                assert str(da_source_sid) in joined
+                assert str(result.derived_scheme_id) in joined
+                assert str(da_target_bid) in joined
+                assert "result=成功" in joined or "result=通过" in joined
+            finally:
+                svc_logger.removeHandler(handler)
+                svc_logger.setLevel(original_level)
+
+            try:
+                svc_d2.derive_and_apply_scheme(da_source_sid, "da_derived_applied", da_target_bid)
+                assert False, "同名应抛 SchemeConflictError"
+            except SchemeConflictError as sce:
+                assert sce.conflict_type == SchemeConflictError.CONFLICT_NAME
+
+            svc_d2.lock_batch(da_target_bid)
+            try:
+                svc_d2.derive_and_apply_scheme(da_source_sid, "da_should_not_exist", da_target_bid)
+                assert False, "锁定批次应抛 BatchLockedError"
+            except BatchLockedError:
+                pass
+
+            assert svc_d2.get_scheme_by_name("da_should_not_exist") is None, \
+                "锁定拒绝时不应创建新方案"
+
+            svc_d2.unlock_batch(da_target_bid)
+
+            r25.ok()
+            print(f"  [PASS] {r25.name}  (derived={result.derived_scheme_id}, "
+                  f"batch={da_target_bid}, cfg_v={result.new_config_version})")
+        except Exception as e:
+            r25.fail(str(e))
+            print(f"  [FAIL] {r25.name}: {e}")
+
+        # ====== 测试 26: derive 后重启查询 - 来源和配置版本持久化 ======
+        r26 = TestResult("测试26: 重启后派生方案来源可查，应用后配置版本保留")
+        results.append(r26)
+        try:
+            svc_pre2 = PipelineService(db_path)
+            restart_src = svc_pre2.save_scheme("restart_derive_src", batch_id=batch_id, description="重启派生源")
+            restart_bid = svc_pre2.create_batch("restart_derive_batch", SAMPLE_CSV)
+            svc_pre2.process_batch(restart_bid)
+            restart_result = svc_pre2.derive_and_apply_scheme(
+                restart_src, "restart_derive_target", restart_bid, "重启前派生应用")
+            expected_v = restart_result.new_config_version
+            expected_derived_id = restart_result.derived_scheme_id
+
+            del svc_pre2
+
+            svc_post2 = PipelineService(db_path)
+
+            derived_after = svc_post2.get_scheme(expected_derived_id)
+            assert derived_after is not None
+            assert derived_after["source_scheme_id"] == restart_src, \
+                f"重启后 source_scheme_id 应为 {restart_src}，实际 {derived_after.get('source_scheme_id')}"
+            assert derived_after["name"] == "restart_derive_target"
+
+            batch_after = svc_post2.get_batch(restart_bid)
+            assert batch_after["config_version"] == expected_v, \
+                f"重启后配置版本应为 v{expected_v}，实际 v{batch_after['config_version']}"
+
+            r26.ok()
+            print(f"  [PASS] {r26.name}  (derived={expected_derived_id}, source={restart_src}, cfg_v={expected_v})")
+        except Exception as e:
+            r26.fail(str(e))
+            print(f"  [FAIL] {r26.name}: {e}")
+
+        # ====== 测试 27: derive 后导出再导入，source_scheme_id 保留 ======
+        r27 = TestResult("测试27: 派生方案导出再导入后来源可追溯，链路可用")
+        results.append(r27)
+        try:
+            svc_d3 = PipelineService(db_path)
+
+            ei_src = svc_d3.save_scheme("ei_source", batch_id=batch_id, description="导出导入源")
+            ei_derived = svc_d3.derive_scheme(ei_src, "ei_derived", "导出导入派生")
+
+            ei_export_dir = os.path.join(tmpdir, "ei_exports")
+            os.makedirs(ei_export_dir, exist_ok=True)
+            ei_path = os.path.join(ei_export_dir, "ei_derived.json")
+            svc_d3.export_scheme_to_file(ei_derived, ei_path)
+
+            with open(ei_path, "r", encoding="utf-8") as f:
+                exported = json.load(f)
+            assert exported.get("source_scheme_id") == ei_src, \
+                f"导出 JSON 应含 source_scheme_id={ei_src}，实际 {exported.get('source_scheme_id')}"
+
+            import_result = svc_d3.import_scheme_from_file(
+                ei_path, on_conflict=SchemeImportResult.ACTION_RENAME,
+                new_name="ei_derived_imported")
+            assert import_result.success
+
+            imported = svc_d3.get_scheme(import_result.scheme_id)
+            assert imported["source_scheme_id"] == ei_src, \
+                f"导入后 source_scheme_id 应为 {ei_src}，实际 {imported.get('source_scheme_id')}"
+            assert imported["name"] == "ei_derived_imported"
+            assert json.dumps(imported["config"], sort_keys=True) == \
+                   json.dumps(svc_d3.get_scheme(ei_derived)["config"], sort_keys=True)
+
+            ei_chain_sid = svc_d3.derive_scheme(import_result.scheme_id, "ei_chain_derived", "链式派生")
+            chain_scheme = svc_d3.get_scheme(ei_chain_sid)
+            assert chain_scheme["source_scheme_id"] == import_result.scheme_id, \
+                "链式派生来源应为导入后的方案"
+
+            r27.ok()
+            print(f"  [PASS] {r27.name}  (derived={ei_derived}, imported={import_result.scheme_id}, chain={ei_chain_sid})")
+        except Exception as e:
+            r27.fail(str(e))
+            print(f"  [FAIL] {r27.name}: {e}")
+
+        # ====== 测试 28: CLI derive / derive-apply / scheme show(来源) + 三边对齐 ======
+        r28 = TestResult("测试28: CLI derive/derive-apply/scheme show 三边对齐")
+        results.append(r28)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+
+            runner = CliRunner()
+
+            res_scheme_help = runner.invoke(cli, ["scheme", "--help"])
+            assert "derive" in res_scheme_help.output, "scheme --help 应包含 derive"
+            assert "derive-apply" in res_scheme_help.output, "scheme --help 应包含 derive-apply"
+
+            res_derive_help = runner.invoke(cli, ["scheme", "derive", "--help"])
+            assert res_derive_help.exit_code == 0
+            assert "source_scheme_id" in res_derive_help.output or "SOURCE_SCHEME_ID" in res_derive_help.output
+            assert "pipeline.service" in res_derive_help.output
+
+            res_da_help = runner.invoke(cli, ["scheme", "derive-apply", "--help"])
+            assert res_da_help.exit_code == 0
+            assert "锁定" in res_da_help.output and "拒绝" in res_da_help.output
+            assert "步骤" in res_da_help.output
+            assert "pipeline.service" in res_da_help.output
+
+            svc_cli = PipelineService(db_path)
+            cli_bid = svc_cli.create_batch("cli_derive_batch", SAMPLE_CSV)
+            svc_cli.process_batch(cli_bid)
+            cli_sid = svc_cli.save_scheme("cli_source", batch_id=cli_bid, description="CLI源")
+            cli_target = svc_cli.create_batch("cli_derive_target", SAMPLE_CSV)
+            svc_cli.process_batch(cli_target)
+
+            res_derive = runner.invoke(cli, ["--db", db_path, "scheme", "derive",
+                                              str(cli_sid), "cli_derived", "--description", "CLI派生"])
+            assert res_derive.exit_code == 0
+            assert "[OK]" in res_derive.output
+            assert "派生方案" in res_derive.output
+            assert "cli_derived" in res_derive.output
+            assert "来源追溯" in res_derive.output
+
+            res_da = runner.invoke(cli, ["--db", db_path, "scheme", "derive-apply",
+                                          str(cli_sid), "cli_da_name", str(cli_target),
+                                          "--description", "CLI派生应用"])
+            assert res_da.exit_code == 0
+            out = res_da.output
+            assert "[OK]" in out
+            assert "源方案" in out and str(cli_sid) in out
+            assert "派生方案" in out and "cli_da_name" in out
+            assert "应用批次" in out and str(cli_target) in out
+            assert "配置版本" in out and "v" in out
+            assert "来源追溯" in out
+
+            res_show = runner.invoke(cli, ["--db", db_path, "scheme", "show", str(cli_sid)])
+            assert "派生来源" in res_show.output
+            assert "原始方案" in res_show.output
+
+            r28.ok()
+            print(f"  [PASS] {r28.name}")
+        except Exception as e:
+            r28.fail(str(e))
+            print(f"  [FAIL] {r28.name}: {e}")
 
         # ====== 汇总 ======
         print()

@@ -79,6 +79,32 @@ class SchemeCloneResult:
         self.message = message
 
 
+class SchemeDeriveResult:
+    """方案派生结果，含来源追溯和步骤级状态"""
+    STEP_VALIDATE_SOURCE = "validate_source"
+    STEP_VALIDATE_BATCH = "validate_batch"
+    STEP_CHECK_LOCKED = "check_locked"
+    STEP_CHECK_CONFLICT = "check_conflict"
+    STEP_VALIDATE_CONFIG = "validate_config"
+    STEP_CREATE_DERIVED = "create_derived"
+    STEP_APPLY_TO_BATCH = "apply_to_batch"
+
+    def __init__(self, success: bool, source_scheme_id: int = None,
+                 source_scheme_name: str = None, derived_scheme_id: int = None,
+                 derived_scheme_name: str = None, applied_batch_id: int = None,
+                 new_config_version: int = None, failed_step: str = None,
+                 message: str = None):
+        self.success = success
+        self.source_scheme_id = source_scheme_id
+        self.source_scheme_name = source_scheme_name
+        self.derived_scheme_id = derived_scheme_id
+        self.derived_scheme_name = derived_scheme_name
+        self.applied_batch_id = applied_batch_id
+        self.new_config_version = new_config_version
+        self.failed_step = failed_step
+        self.message = message
+
+
 class PipelineService:
     """流水线服务类"""
 
@@ -683,6 +709,190 @@ class PipelineService:
         finally:
             conn.close()
 
+    def derive_scheme(self, source_scheme_id: int, new_name: str,
+                      new_description: str = None) -> int:
+        """
+        基于已有方案派生出新方案，记录来源关系（source_scheme_id）。
+        步骤级校验 + 日志：
+        1. 校验源方案存在
+        2. 校验新名称不冲突
+        3. 校验配置完整
+        4. 创建派生方案（含 source_scheme_id）
+        """
+        conn = self._conn()
+        try:
+            source = db.get_scheme(conn, source_scheme_id)
+            if not source:
+                logger.info(
+                    f"派生失败(步骤1-校验源方案): source_id={source_scheme_id}, "
+                    f"result=源方案不存在"
+                )
+                raise SchemeError(f"源方案不存在: {source_scheme_id}")
+            logger.info(
+                f"派生步骤1-校验源方案: source_id={source_scheme_id}, "
+                f"source_name='{source['name']}', result=通过"
+            )
+
+            existing = db.get_scheme_by_name(conn, new_name)
+            if existing:
+                logger.info(
+                    f"派生失败(步骤2-校验名称冲突): source_id={source_scheme_id}, "
+                    f"source_name='{source['name']}', new_name='{new_name}', "
+                    f"result=名称已存在(existing_id={existing['id']})"
+                )
+                raise SchemeConflictError(
+                    SchemeConflictError.CONFLICT_NAME,
+                    f"方案名称已存在: '{new_name}'",
+                    {
+                        "existing_scheme_id": existing["id"],
+                        "source_scheme_id": source_scheme_id,
+                        "source_scheme_name": source["name"]
+                    }
+                )
+            logger.info(
+                f"派生步骤2-校验名称冲突: new_name='{new_name}', result=通过"
+            )
+
+            description = new_description if new_description is not None else source.get("description")
+            config = source["config"]
+
+            valid, missing = db.validate_scheme_config(config)
+            if not valid:
+                logger.info(
+                    f"派生失败(步骤3-校验配置): source_id={source_scheme_id}, "
+                    f"result=缺少必填字段({', '.join(missing)})"
+                )
+                raise SchemeConflictError(
+                    SchemeConflictError.CONFLICT_MISSING_FIELDS,
+                    f"源方案配置缺少必填字段: {', '.join(missing)}",
+                    {"missing_fields": missing, "source_scheme_id": source_scheme_id}
+                )
+            logger.info(
+                f"派生步骤3-校验配置: source_id={source_scheme_id}, result=通过"
+            )
+
+            derived_id = db.create_scheme(conn, new_name, config, description,
+                                          source_scheme_id=source_scheme_id)
+            logger.info(
+                f"派生步骤4-创建派生方案: source_id={source_scheme_id}, "
+                f"source_name='{source['name']}', derived_id={derived_id}, "
+                f"derived_name='{new_name}', result=成功"
+            )
+            return derived_id
+        finally:
+            conn.close()
+
+    def derive_and_apply_scheme(self, source_scheme_id: int, new_name: str,
+                                batch_id: int, new_description: str = None) -> SchemeDeriveResult:
+        """
+        派生方案并立即应用到指定批次。步骤级校验 + 日志，失败时记录 failed_step。
+        校验顺序：源方案 → 批次存在 → 批次未锁定 → 名称不冲突 → 配置完整 → 创建方案 → 应用
+        """
+        conn = self._conn()
+        try:
+            source = db.get_scheme(conn, source_scheme_id)
+            if not source:
+                logger.info(
+                    f"派生并应用失败(步骤1-校验源方案): source_id={source_scheme_id}, "
+                    f"batch_id={batch_id}, result=源方案不存在"
+                )
+                raise SchemeError(f"源方案不存在: {source_scheme_id}")
+            logger.info(
+                f"派生并应用步骤1-校验源方案: source_id={source_scheme_id}, "
+                f"source_name='{source['name']}', result=通过"
+            )
+
+            batch = db.get_batch(conn, batch_id)
+            if not batch:
+                logger.info(
+                    f"派生并应用失败(步骤2-校验批次): source_id={source_scheme_id}, "
+                    f"batch_id={batch_id}, result=批次不存在"
+                )
+                raise BatchServiceError(f"批次不存在: {batch_id}")
+            logger.info(
+                f"派生并应用步骤2-校验批次: batch_id={batch_id}, result=通过"
+            )
+
+            if db.is_batch_locked(conn, batch_id):
+                logger.info(
+                    f"派生并应用失败(步骤3-校验锁定): source_id={source_scheme_id}, "
+                    f"batch_id={batch_id}, result=批次已锁定"
+                )
+                raise BatchLockedError(
+                    f"批次 {batch_id} 已锁定，无法应用派生方案。"
+                    f"如需使用该方案进行对比分析，请使用 compare 命令直接生成报告，"
+                    f"而不要修改已锁定批次的历史配置。"
+                )
+            logger.info(
+                f"派生并应用步骤3-校验锁定: batch_id={batch_id}, result=未锁定(通过)"
+            )
+
+            existing = db.get_scheme_by_name(conn, new_name)
+            if existing:
+                logger.info(
+                    f"派生并应用失败(步骤4-校验名称冲突): source_id={source_scheme_id}, "
+                    f"new_name='{new_name}', result=名称已存在(existing_id={existing['id']})"
+                )
+                raise SchemeConflictError(
+                    SchemeConflictError.CONFLICT_NAME,
+                    f"方案名称已存在: '{new_name}'",
+                    {
+                        "existing_scheme_id": existing["id"],
+                        "source_scheme_id": source_scheme_id,
+                        "source_scheme_name": source["name"]
+                    }
+                )
+            logger.info(
+                f"派生并应用步骤4-校验名称冲突: new_name='{new_name}', result=通过"
+            )
+
+            description = new_description if new_description is not None else source.get("description")
+            config = source["config"]
+
+            valid, missing = db.validate_scheme_config(config)
+            if not valid:
+                logger.info(
+                    f"派生并应用失败(步骤5-校验配置): source_id={source_scheme_id}, "
+                    f"result=缺少必填字段({', '.join(missing)})"
+                )
+                raise SchemeConflictError(
+                    SchemeConflictError.CONFLICT_MISSING_FIELDS,
+                    f"源方案配置缺少必填字段: {', '.join(missing)}",
+                    {"missing_fields": missing, "source_scheme_id": source_scheme_id}
+                )
+            logger.info(
+                f"派生并应用步骤5-校验配置: source_id={source_scheme_id}, result=通过"
+            )
+
+            derived_id = db.create_scheme(conn, new_name, config, description,
+                                          source_scheme_id=source_scheme_id)
+            logger.info(
+                f"派生并应用步骤6-创建派生方案: source_id={source_scheme_id}, "
+                f"source_name='{source['name']}', derived_id={derived_id}, "
+                f"derived_name='{new_name}', result=成功"
+            )
+
+            new_cfg = bump_config_version(config)
+            db.update_batch_config(conn, batch_id, new_cfg)
+            logger.info(
+                f"派生并应用步骤7-应用到批次: derived_id={derived_id}, "
+                f"derived_name='{new_name}', batch_id={batch_id}, "
+                f"new_config_version={new_cfg['version']}, result=成功"
+            )
+
+            return SchemeDeriveResult(
+                success=True,
+                source_scheme_id=source_scheme_id,
+                source_scheme_name=source["name"],
+                derived_scheme_id=derived_id,
+                derived_scheme_name=new_name,
+                applied_batch_id=batch_id,
+                new_config_version=new_cfg["version"],
+                message="方案派生并应用成功"
+            )
+        finally:
+            conn.close()
+
     def export_scheme_to_file(self, scheme_id: int, file_path: str) -> str:
         """将方案导出为 JSON 文件"""
         conn = self._conn()
@@ -695,6 +905,7 @@ class PipelineService:
                 "description": scheme.get("description"),
                 "scheme_version": scheme["scheme_version"],
                 "config": scheme["config"],
+                "source_scheme_id": scheme.get("source_scheme_id"),
                 "exported_at": datetime.now().isoformat()
             }
             os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
@@ -754,6 +965,7 @@ class PipelineService:
                 pass
 
         description = data.get("description")
+        source_scheme_id = data.get("source_scheme_id")
         conn = self._conn()
         try:
             existing = db.get_scheme_by_name(conn, name)
@@ -777,7 +989,8 @@ class PipelineService:
                     while db.get_scheme_by_name(conn, final_name):
                         final_name = f"{name}_imported_{counter}"
                         counter += 1
-                    sid = db.create_scheme(conn, final_name, config, description)
+                    sid = db.create_scheme(conn, final_name, config, description,
+                                           source_scheme_id=source_scheme_id)
                     result = SchemeImportResult(True, sid, SchemeImportResult.ACTION_RENAME,
                                                 f"已重命名导入: '{final_name}'")
                     logger.info(f"方案导入(重命名): file='{file_path}', scheme_id={sid}, original='{name}', final='{final_name}'")
@@ -790,7 +1003,8 @@ class PipelineService:
                 else:
                     raise SchemeError(f"未知冲突处理策略: {on_conflict}")
             else:
-                sid = db.create_scheme(conn, name, config, description)
+                sid = db.create_scheme(conn, name, config, description,
+                                       source_scheme_id=source_scheme_id)
                 result = SchemeImportResult(True, sid, None, f"已导入方案 '{name}'")
                 logger.info(f"方案导入: file='{file_path}', scheme_id={sid}, name='{name}'")
                 return result

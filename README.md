@@ -88,6 +88,8 @@ python -m pipeline scheme --help
 | `scheme apply SCHEME_ID BATCH_ID` | 将方案应用到未锁定批次（不自动重跑） |
 | `scheme clone SOURCE_SCHEME_ID NEW_NAME [--description TEXT]` | 基于已有方案克隆出新方案，可改名称和描述 |
 | `scheme clone-apply SOURCE_SCHEME_ID NEW_NAME BATCH_ID [--description TEXT]` | 克隆方案并立即应用到未锁定批次（不自动重跑） |
+| `scheme derive SOURCE_SCHEME_ID NEW_NAME [--description TEXT]` | 基于已有方案派生出新方案，记录来源关系（source_scheme_id） |
+| `scheme derive-apply SOURCE_SCHEME_ID NEW_NAME BATCH_ID [--description TEXT]` | 派生方案并立即应用到未锁定批次，7步校验+步骤级日志 |
 | `scheme export SCHEME_ID -o FILE.json` | 导出方案为 JSON 文件 |
 | `scheme import FILE.json [--on-conflict ask\|overwrite\|rename\|skip] [--new-name NAME]` | 从文件导入方案 |
 | `scheme delete SCHEME_ID` | 删除方案 |
@@ -180,7 +182,7 @@ python -m pipeline compare --help
 ## 锁定保护机制
 
 1. 批次锁定后 `process` 无条件拒绝，不产生新 Run
-2. 批次锁定后无法修改配置（包括 `set-threshold` 和 `scheme apply`）
+2. 批次锁定后无法修改配置（包括 `set-threshold`、`scheme apply`、`scheme clone-apply`）。`clone-apply` 在克隆前先校验锁定，锁定时**不创建新方案**（原子性）
 3. 锁定批次可以正常参与对比分析和导出操作，历史数据不会被污染
 4. 对比报告始终基于各批次锁定时的最新 Run 结果生成，与方案解耦
 
@@ -197,7 +199,18 @@ python -m pipeline compare --help
 
 ## 日志
 
-使用 Python `logging` 模块，Logger 名称 `pipeline.service`。关键操作（方案保存、导入、对比报告生成）会输出 INFO 级别日志，包含方案/报告 ID、名称和参与批次。
+使用 Python `logging` 模块，Logger 名称 `pipeline.service`，所有方案克隆相关操作均输出 `INFO` 级别日志：
+
+| 操作 | 日志条数 | 关键字段 |
+|------|----------|----------|
+| `scheme save` | 1 | id、name、batch_id |
+| `scheme import`（四种分支各 1 条） | 1 | file、scheme_id、name、original/final |
+| `scheme apply` | 1 | scheme_id、scheme_name、batch_id、new_config_version |
+| `scheme clone` | 1 | source_id、source_name、cloned_id、cloned_name |
+| `scheme clone-apply` | 2 | 克隆一条（含链路标记）+ 应用一条（含 scheme_id、scheme_name、batch_id、new_config_version） |
+| `compare run` | 1 | id、name、scheme、batch_ids |
+
+方案克隆链路的日志样例见上文"方案克隆与应用链路使用说明 → 日志定位"。
 
 ## 测试
 

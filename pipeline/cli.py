@@ -7,7 +7,8 @@ from tabulate import tabulate
 
 from .service import (
     PipelineService, BatchServiceError, BatchLockedError,
-    SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult
+    SchemeError, SchemeConflictError, SchemeImportResult, SchemeCloneResult,
+    SchemeDeriveResult
 )
 from .config import get_default_config, load_config
 
@@ -378,6 +379,7 @@ def scheme_list(ctx):
             "ID": s["id"],
             "名称": s["name"],
             "版本": s["scheme_version"],
+            "来源": f"#{s['source_scheme_id']}" if s.get("source_scheme_id") else "原始",
             "描述": s.get("description") or "",
             "创建": s["created_at"][:19],
             "更新": s["updated_at"][:19]
@@ -399,6 +401,11 @@ def scheme_show(ctx, scheme_id):
     click.echo(f"  名称:       {s['name']}")
     click.echo(f"  描述:       {s.get('description') or '(无)'}")
     click.echo(f"  版本:       {s['scheme_version']}")
+    source_sid = s.get("source_scheme_id")
+    if source_sid:
+        click.echo(f"  派生来源:   方案 #{source_sid}")
+    else:
+        click.echo(f"  派生来源:   (原始方案)")
     click.echo(f"  创建时间:   {s['created_at']}")
     click.echo(f"  更新时间:   {s['updated_at']}")
     click.echo("\n  配置内容:")
@@ -534,6 +541,73 @@ def scheme_clone_apply(ctx, source_scheme_id, new_name, batch_id, description):
         click.echo(f"  源方案:   ID={result.source_scheme_id}, 名称='{result.source_scheme_name}'")
         click.echo(f"  新方案:   ID={result.cloned_scheme_id}, 名称='{result.cloned_scheme_name}'")
         click.echo(f"  应用批次: ID={result.applied_batch_id}, 配置版本升至 v{result.new_config_version}")
+        click.echo("  请执行 process 命令以使用新配置重跑该批次。")
+    except SchemeConflictError as e:
+        click.echo(f"{ERR} 冲突({e.conflict_type}): {e}", err=True)
+        click.echo(f"  详情: {e.details}", err=True)
+        sys.exit(1)
+    except BatchLockedError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+    except SchemeError as e:
+        click.echo(f"{ERR} 方案错误: {e}", err=True)
+        sys.exit(1)
+    except BatchServiceError as e:
+        click.echo(f"{ERR} 批次错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("derive")
+@click.argument("source_scheme_id", type=int)
+@click.argument("new_name")
+@click.option("--description", default=None, help="新方案描述（不指定则沿用源方案）")
+@click.pass_context
+def scheme_derive(ctx, source_scheme_id, new_name, description):
+    """基于已有方案派生出新方案，记录来源关系，可改名称和描述。
+
+    派生方案会记录 source_scheme_id，可通过 scheme show 追溯来源。
+    同名时直接报错（name_exists），不会自动覆盖或重命名。
+    成功后终端输出源方案 ID/名称 和 派生方案 ID/名称。
+    日志位置：Logger=pipeline.service，级别=INFO，每步校验均输出步骤级结果。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        derived_id = svc.derive_scheme(source_scheme_id, new_name, description)
+        click.echo(f"{OK} 方案派生成功")
+        click.echo(f"  源方案:     ID={source_scheme_id}")
+        click.echo(f"  派生方案:   ID={derived_id}, 名称='{new_name}'")
+        click.echo(f"  来源追溯:   可通过 scheme show {derived_id} 查看派生来源")
+    except SchemeConflictError as e:
+        click.echo(f"{ERR} 冲突({e.conflict_type}): {e}", err=True)
+        click.echo(f"  详情: {e.details}", err=True)
+        sys.exit(1)
+    except SchemeError as e:
+        click.echo(f"{ERR} 方案错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("derive-apply")
+@click.argument("source_scheme_id", type=int)
+@click.argument("new_name")
+@click.argument("batch_id", type=int)
+@click.option("--description", default=None, help="新方案描述（不指定则沿用源方案）")
+@click.pass_context
+def scheme_derive_apply(ctx, source_scheme_id, new_name, batch_id, description):
+    """派生方案并立即应用到未锁定批次（不自动重跑）。
+
+    原子性：先按顺序校验（源方案→批次→锁定→名称冲突→配置完整），再创建并应用。
+    锁定批次直接拒绝（不会创建新方案），与 scheme apply 规则一致。
+    同名时直接报错（name_exists），不会自动覆盖或重命名。
+    派生方案会记录 source_scheme_id，可通过 scheme show 追溯来源。
+    成功后终端输出：源方案 ID/名称、派生方案 ID/名称、批次 ID、新配置版本。
+    日志位置：Logger=pipeline.service，级别=INFO，7步校验/操作均输出步骤级结果。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.derive_and_apply_scheme(source_scheme_id, new_name, batch_id, description)
+        click.echo(f"{OK} 方案派生并应用成功")
+        click.echo(f"  源方案:     ID={result.source_scheme_id}, 名称='{result.source_scheme_name}'")
+        click.echo(f"  派生方案:   ID={result.derived_scheme_id}, 名称='{result.derived_scheme_name}'")
+        click.echo(f"  应用批次:   ID={result.applied_batch_id}, 配置版本升至 v{result.new_config_version}")
+        click.echo(f"  来源追溯:   可通过 scheme show {result.derived_scheme_id} 查看派生来源")
         click.echo("  请执行 process 命令以使用新配置重跑该批次。")
     except SchemeConflictError as e:
         click.echo(f"{ERR} 冲突({e.conflict_type}): {e}", err=True)
