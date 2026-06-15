@@ -659,8 +659,17 @@ def scheme_import(ctx, file_path, on_conflict, new_name):
                 "rename": "重命名导入"
             }.get(result.action, "导入")
             click.echo(f"{OK} {action_label}成功: ID={result.scheme_id}, {result.message}")
+            if result.original_name and result.original_name != result.final_name:
+                click.echo(f"  原始名称:   {result.original_name}")
+                click.echo(f"  落地名称:   {result.final_name}")
+            if result.original_id:
+                click.echo(f"  原始ID:     {result.original_id}")
+            if result.imported_from:
+                click.echo(f"  导入来源:   {result.imported_from}")
         else:
             click.echo(f"  已跳过: {result.message}")
+            if result.original_name:
+                click.echo(f"  原始名称:   {result.original_name}")
     except SchemeConflictError as e:
         click.echo(f"{ERR} 导入冲突 ({e.conflict_type}): {e}", err=True)
         click.echo(f"  详情: {e.details}", err=True)
@@ -668,6 +677,154 @@ def scheme_import(ctx, file_path, on_conflict, new_name):
         sys.exit(1)
     except SchemeError as e:
         click.echo(f"{ERR} 方案错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("import-apply")
+@click.argument("file_path", type=click.Path(exists=True))
+@click.argument("batch_id", type=int)
+@click.option("--on-conflict", type=click.Choice(["overwrite", "rename", "skip"]), default="rename",
+              help="冲突处理策略: overwrite=覆盖, rename=自动重命名(默认), skip=跳过")
+@click.option("--new-name", default=None, help="重命名时使用的新名称")
+@click.pass_context
+def scheme_import_apply(ctx, file_path, batch_id, on_conflict, new_name):
+    """从 JSON 文件导入方案并立即应用到批次（一步完成导入+应用链路）。
+
+    完整流程：导出 JSON → 外部修改 → import-apply 导入并应用 → 必要时 rollback。
+    导入冲突按 --on-conflict 策略处理（默认 rename）。
+    成功后终端输出：方案ID、名称、原始名称(若重命名)、原始ID、导入来源、批次ID、配置版本变化。
+    导入和应用均记录审计日志，rollback 可撤销。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        result = svc.import_and_apply_scheme(file_path, batch_id, on_conflict, new_name)
+        ir = result["import_result"]
+        if not ir.success:
+            click.echo(f"{ERR} 导入失败: {ir.message}", err=True)
+            sys.exit(1)
+
+        new_cfg = result["apply_config"]
+        click.echo(f"{OK} 方案导入并应用成功")
+        click.echo(f"  方案ID:     {ir.scheme_id}")
+        click.echo(f"  方案名称:   {ir.final_name}")
+        if ir.original_name and ir.original_name != ir.final_name:
+            click.echo(f"  原始名称:   {ir.original_name}")
+        if ir.original_id:
+            click.echo(f"  原始ID:     {ir.original_id}")
+        if ir.imported_from:
+            click.echo(f"  导入来源:   {ir.imported_from}")
+        click.echo(f"  应用批次:   #{batch_id}")
+        if new_cfg:
+            click.echo(f"  配置版本:   v{new_cfg['version']}")
+        click.echo("  请执行 process 命令以使用新配置重跑该批次。")
+    except BatchLockedError as e:
+        click.echo(f"{ERR} {e}", err=True)
+        sys.exit(1)
+    except SchemeConflictError as e:
+        click.echo(f"{ERR} 导入冲突 ({e.conflict_type}): {e}", err=True)
+        click.echo(f"  详情: {e.details}", err=True)
+        sys.exit(1)
+    except SchemeError as e:
+        click.echo(f"{ERR} 方案错误: {e}", err=True)
+        sys.exit(1)
+    except BatchServiceError as e:
+        click.echo(f"{ERR} 批次错误: {e}", err=True)
+        sys.exit(1)
+
+
+@scheme.command("last-change")
+@click.argument("batch_id", type=int)
+@click.pass_context
+def scheme_last_change(ctx, batch_id):
+    """查看批次最近一次方案变更结果。
+
+    输出包含：批次状态、当前方案、版本变化、操作类型、触发方式、
+    失败原因、配置差异、回滚信息、方案来源追溯（original_id/imported_from）。
+    数据持久化在审计日志中，重启后仍可查询。"""
+    svc = _get_service(ctx.obj.get("db_path"))
+    try:
+        info = svc.get_latest_scheme_change(batch_id)
+
+        click.echo(f"=== 批次 #{info['batch_id']} 方案变更结果 ===")
+        click.echo(f"  批次名称:   {info['batch_name']}")
+        click.echo(f"  批次状态:   {info['batch_status']}" +
+                   (" (已锁定)" if info['batch_locked'] else ""))
+        if info.get("current_scheme_id"):
+            click.echo(f"  当前方案:   #{info['current_scheme_id']} {info['current_scheme_name'] or ''}")
+        else:
+            click.echo(f"  当前方案:   (无)")
+        click.echo(f"  当前配置:   v{info['current_config_version']}")
+
+        lc = info.get("latest_change")
+        if not lc:
+            click.echo(f"\n  {info.get('message', '该批次尚无方案变更记录')}")
+            return
+
+        click.echo(f"\n--- 最近一次变更 ---")
+        action_labels = {
+            "apply": "应用", "clone_apply": "克隆应用",
+            "derive_apply": "派生应用", "import": "导入",
+            "import_apply": "导入应用", "rollback": "回滚",
+            "direct_modify": "直接修改"
+        }
+        result_labels = {"success": "成功", "failed": "失败", "blocked": "阻止"}
+        trigger_labels = {"cli": "CLI", "api": "API", "import": "导入"}
+
+        click.echo(f"  操作:       {action_labels.get(lc['action'], lc['action'])}")
+        click.echo(f"  触发方式:   {trigger_labels.get(lc['trigger_method'], lc['trigger_method'])}")
+        click.echo(f"  结果:       {result_labels.get(lc['result'], lc['result'])}")
+        if lc.get("scheme_id"):
+            click.echo(f"  方案:       #{lc['scheme_id']}" +
+                       (f" '{lc['scheme_name']}'" if lc.get("scheme_name") else ""))
+        if lc.get("source_scheme_id"):
+            click.echo(f"  来源方案:   #{lc['source_scheme_id']}")
+        if lc.get("version_change"):
+            vc = lc["version_change"]
+            click.echo(f"  版本变化:   v{vc['old']} -> v{vc['new']}")
+        if lc.get("error_message"):
+            click.echo(f"  失败原因:   {lc['error_message']}")
+        click.echo(f"  发生时间:   {lc['created_at'][:19]}")
+
+        sd = info.get("scheme_detail")
+        if sd:
+            click.echo(f"\n--- 方案详情 ---")
+            click.echo(f"  方案ID:     {sd['scheme_id']}")
+            click.echo(f"  方案名称:   {sd['scheme_name']}")
+            click.echo(f"  方案版本:   {sd['scheme_version']}")
+            if sd.get("source_scheme_id"):
+                click.echo(f"  派生来源:   #{sd['source_scheme_id']}")
+            if sd.get("original_id"):
+                click.echo(f"  原始ID:     {sd['original_id']}")
+            if sd.get("imported_from"):
+                click.echo(f"  导入来源:   {sd['imported_from']}")
+
+        rb = info.get("rollback_info")
+        if rb:
+            click.echo(f"\n--- 回滚信息 ---")
+            click.echo(f"  回滚自历史: #{rb['rolled_back_from_history_id']}")
+            if rb.get("rolled_back_to_scheme_id"):
+                click.echo(f"  回滚到方案: #{rb['rolled_back_to_scheme_id']}" +
+                           (f" '{rb['rolled_back_to_scheme_name']}'" if rb.get("rolled_back_to_scheme_name") else ""))
+
+        cd = lc.get("config_diff") if lc else None
+        if cd:
+            has_changes = cd.get("added") or cd.get("modified") or cd.get("removed")
+            if has_changes:
+                click.echo(f"\n--- 配置差异 ---")
+                if cd.get("added"):
+                    click.echo(f"  新增 ({len(cd['added'])}):")
+                    for k, v in cd["added"].items():
+                        click.echo(f"    + {k} = {v}")
+                if cd.get("modified"):
+                    click.echo(f"  修改 ({len(cd['modified'])}):")
+                    for k, v in cd["modified"].items():
+                        click.echo(f"    ~ {k}: {v['old']} -> {v['new']}")
+                if cd.get("removed"):
+                    click.echo(f"  删除 ({len(cd['removed'])}):")
+                    for k, v in cd["removed"].items():
+                        click.echo(f"    - {k} = {v}")
+
+    except BatchServiceError as e:
+        click.echo(f"{ERR} 批次错误: {e}", err=True)
         sys.exit(1)
 
 

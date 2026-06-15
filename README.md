@@ -98,6 +98,8 @@ python -m pipeline scheme --help
 | `scheme audit-history [BATCH_ID] [--scheme-id N] [--action TYPE] [--result TYPE] [--limit N] [--diff]` | 查看方案应用审计历史（含配置差异、结果、失败原因） |
 | `scheme export SCHEME_ID -o FILE.json` | 导出方案为 JSON 文件 |
 | `scheme import FILE.json [--on-conflict ask\|overwrite\|rename\|skip] [--new-name NAME]` | 从文件导入方案 |
+| `scheme import-apply FILE.json BATCH_ID [--on-conflict overwrite\|rename\|skip] [--new-name NAME]` | 从文件导入方案并一步应用到批次 |
+| `scheme last-change BATCH_ID` | 查看批次最近一次方案变更结果 |
 | `scheme delete SCHEME_ID` | 删除方案 |
 
 **导入冲突处理策略：**

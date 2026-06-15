@@ -57,11 +57,17 @@ class SchemeImportResult:
     ACTION_SKIP = "skip"
 
     def __init__(self, success: bool, scheme_id: int = None, action: str = None,
-                 message: str = None):
+                 message: str = None, original_name: str = None,
+                 final_name: str = None, original_id: int = None,
+                 imported_from: str = None):
         self.success = success
         self.scheme_id = scheme_id
         self.action = action
         self.message = message
+        self.original_name = original_name
+        self.final_name = final_name
+        self.original_id = original_id
+        self.imported_from = imported_from
 
 
 class SchemeCloneResult:
@@ -279,7 +285,7 @@ class PipelineService:
             )
 
     def update_config(self, batch_id: int, new_config: Dict[str, Any]) -> Dict[str, Any]:
-        """更新批次配置（版本号自动递增），记录历史（direct 操作）"""
+        """更新批次配置（版本号自动递增），记录历史（direct 操作）和审计日志"""
         conn = self._conn()
         try:
             batch = db.get_batch(conn, batch_id)
@@ -292,6 +298,8 @@ class PipelineService:
             self._ensure_history_baseline(conn, batch_id, current_cfg)
 
             updated_cfg = bump_config_version(new_config)
+            config_diff = db.compute_config_diff(current_cfg, updated_cfg)
+
             db.update_batch_config(conn, batch_id, updated_cfg)
 
             db.add_scheme_history(
@@ -300,6 +308,17 @@ class PipelineService:
                 scheme_id=batch.get("current_scheme_id"),
                 scheme_name=batch.get("current_scheme_name")
             )
+
+            db.add_scheme_audit_log(
+                conn, batch_id=batch_id, action=db.AUDIT_ACTION_DIRECT_MODIFY,
+                trigger_method=db.AUDIT_TRIGGER_CLI,
+                result=db.AUDIT_RESULT_SUCCESS,
+                scheme_id=batch.get("current_scheme_id"),
+                scheme_name=batch.get("current_scheme_name"),
+                previous_config=current_cfg, new_config=updated_cfg,
+                config_diff=config_diff
+            )
+
             logger.info(
                 f"配置已更新(direct): batch_id={batch_id}, "
                 f"new_config_version={updated_cfg['version']}"
@@ -1540,6 +1559,7 @@ class PipelineService:
         从 JSON 文件导入方案。
         on_conflict: overwrite / rename / skip (None 时抛出异常让调用方处理)
         导入时保留 original_id（导出时的原始 ID）用于历史追溯
+        每种导入结果均记录审计日志（trigger_method=import），保证可追溯
         """
         if not os.path.exists(file_path):
             raise SchemeError(f"方案文件不存在: {file_path}")
@@ -1568,7 +1588,10 @@ class PipelineService:
                     {"imported_version": imported_version, "current_version": db.SCHEME_VERSION}
                 )
             elif on_conflict == SchemeImportResult.ACTION_SKIP:
-                return SchemeImportResult(False, None, SchemeImportResult.ACTION_SKIP, version_msg)
+                return SchemeImportResult(False, None, SchemeImportResult.ACTION_SKIP,
+                                          version_msg, original_name=name,
+                                          original_id=original_id,
+                                          imported_from=file_path)
             else:
                 pass
 
@@ -1582,7 +1605,9 @@ class PipelineService:
                 )
             elif on_conflict == SchemeImportResult.ACTION_SKIP:
                 return SchemeImportResult(False, None, SchemeImportResult.ACTION_SKIP,
-                                          f"缺少字段: {', '.join(missing)}")
+                                          f"缺少字段: {', '.join(missing)}",
+                                          original_name=name, original_id=original_id,
+                                          imported_from=file_path)
             else:
                 pass
 
@@ -1602,10 +1627,20 @@ class PipelineService:
                     )
                 elif on_conflict == SchemeImportResult.ACTION_OVERWRITE:
                     db.update_scheme(conn, existing["id"], config, description)
-                    result = SchemeImportResult(True, existing["id"],
-                                                SchemeImportResult.ACTION_OVERWRITE,
-                                                f"已覆盖方案 '{name}'")
-                    logger.info(f"方案导入(覆盖): file='{file_path}', scheme_id={existing['id']}, name='{name}'")
+                    db.add_scheme_audit_log(
+                        conn, batch_id=None, action=db.AUDIT_ACTION_IMPORT,
+                        trigger_method=db.AUDIT_TRIGGER_IMPORT,
+                        result=db.AUDIT_RESULT_SUCCESS,
+                        scheme_id=existing["id"], scheme_name=name,
+                        source_scheme_id=source_scheme_id,
+                        error_message=None
+                    )
+                    result = SchemeImportResult(
+                        True, existing["id"], SchemeImportResult.ACTION_OVERWRITE,
+                        f"已覆盖方案 '{name}'", original_name=name,
+                        final_name=name, original_id=original_id,
+                        imported_from=imported_from)
+                    logger.info(f"方案导入(覆盖): file='{file_path}', scheme_id={existing['id']}, name='{name}', original_id={original_id}")
                     return result
                 elif on_conflict == SchemeImportResult.ACTION_RENAME:
                     final_name = new_name or f"{name}_imported"
@@ -1617,13 +1652,35 @@ class PipelineService:
                                            source_scheme_id=source_scheme_id,
                                            original_id=original_id,
                                            imported_from=imported_from)
-                    result = SchemeImportResult(True, sid, SchemeImportResult.ACTION_RENAME,
-                                                f"已重命名导入: '{final_name}'")
+                    db.add_scheme_audit_log(
+                        conn, batch_id=None, action=db.AUDIT_ACTION_IMPORT,
+                        trigger_method=db.AUDIT_TRIGGER_IMPORT,
+                        result=db.AUDIT_RESULT_SUCCESS,
+                        scheme_id=sid, scheme_name=final_name,
+                        source_scheme_id=source_scheme_id,
+                        error_message=None
+                    )
+                    result = SchemeImportResult(
+                        True, sid, SchemeImportResult.ACTION_RENAME,
+                        f"已重命名导入: '{name}' -> '{final_name}'",
+                        original_name=name, final_name=final_name,
+                        original_id=original_id, imported_from=imported_from)
                     logger.info(f"方案导入(重命名): file='{file_path}', scheme_id={sid}, original='{name}', final='{final_name}', original_id={original_id}")
                     return result
                 elif on_conflict == SchemeImportResult.ACTION_SKIP:
-                    result = SchemeImportResult(False, None, SchemeImportResult.ACTION_SKIP,
-                                                f"已跳过同名方案 '{name}'")
+                    db.add_scheme_audit_log(
+                        conn, batch_id=None, action=db.AUDIT_ACTION_IMPORT,
+                        trigger_method=db.AUDIT_TRIGGER_IMPORT,
+                        result=db.AUDIT_RESULT_BLOCKED,
+                        scheme_id=existing["id"], scheme_name=name,
+                        source_scheme_id=source_scheme_id,
+                        error_message=f"同名方案已存在，跳过导入: '{name}'"
+                    )
+                    result = SchemeImportResult(
+                        False, None, SchemeImportResult.ACTION_SKIP,
+                        f"已跳过同名方案 '{name}'",
+                        original_name=name, final_name=None,
+                        original_id=original_id, imported_from=imported_from)
                     logger.info(f"方案导入(跳过): file='{file_path}', name='{name}' (已存在同名方案)")
                     return result
                 else:
@@ -1633,7 +1690,18 @@ class PipelineService:
                                        source_scheme_id=source_scheme_id,
                                        original_id=original_id,
                                        imported_from=imported_from)
-                result = SchemeImportResult(True, sid, None, f"已导入方案 '{name}'")
+                db.add_scheme_audit_log(
+                    conn, batch_id=None, action=db.AUDIT_ACTION_IMPORT,
+                    trigger_method=db.AUDIT_TRIGGER_IMPORT,
+                    result=db.AUDIT_RESULT_SUCCESS,
+                    scheme_id=sid, scheme_name=name,
+                    source_scheme_id=source_scheme_id,
+                    error_message=None
+                )
+                result = SchemeImportResult(
+                    True, sid, None, f"已导入方案 '{name}'",
+                    original_name=name, final_name=name,
+                    original_id=original_id, imported_from=imported_from)
                 logger.info(f"方案导入: file='{file_path}', scheme_id={sid}, name='{name}', original_id={original_id}")
                 return result
         finally:
@@ -2132,3 +2200,132 @@ class PipelineService:
         paths["anomalies"] = os.path.abspath(anomalies_path)
 
         return paths
+
+    # ========== 导入应用链路 ==========
+
+    def import_and_apply_scheme(self, file_path: str, batch_id: int,
+                                on_conflict: str = None,
+                                new_name: str = None,
+                                trigger_method: str = db.AUDIT_TRIGGER_IMPORT) -> Dict[str, Any]:
+        """
+        从 JSON 文件导入方案并立即应用到指定批次。
+        完整链路：导入→冲突处理→应用到批次→记录历史和审计日志。
+        返回 dict 包含 import_result 和 apply_config。
+        """
+        import_result = self.import_scheme_from_file(file_path, on_conflict, new_name)
+        if not import_result.success:
+            return {"import_result": import_result, "apply_config": None}
+
+        scheme_id = import_result.scheme_id
+        new_cfg = self.apply_scheme_to_batch(scheme_id, batch_id, trigger_method=trigger_method)
+
+        conn = self._conn()
+        try:
+            batch = db.get_batch(conn, batch_id)
+            if batch:
+                previous_config = json.loads(batch["config_json"])
+                config_diff = db.compute_config_diff(previous_config, new_cfg)
+                db.add_scheme_audit_log(
+                    conn, batch_id=batch_id, action=db.AUDIT_ACTION_IMPORT_APPLY,
+                    trigger_method=trigger_method, result=db.AUDIT_RESULT_SUCCESS,
+                    scheme_id=scheme_id, scheme_name=import_result.final_name,
+                    source_scheme_id=None,
+                    previous_config=previous_config, new_config=new_cfg,
+                    config_diff=config_diff
+                )
+            logger.info(
+                f"方案导入并应用: file='{file_path}', scheme_id={scheme_id}, "
+                f"scheme_name='{import_result.final_name}', batch_id={batch_id}, "
+                f"new_config_version={new_cfg['version']}, "
+                f"original_name='{import_result.original_name}', "
+                f"original_id={import_result.original_id}"
+            )
+        finally:
+            conn.close()
+
+        return {"import_result": import_result, "apply_config": new_cfg}
+
+    # ========== 最近变更快查 ==========
+
+    def get_latest_scheme_change(self, batch_id: int) -> Optional[Dict[str, Any]]:
+        """
+        获取批次最近一次方案变更结果。
+        返回 dict 包含：批次信息、方案信息、版本变化、操作类型、触发方式、
+        结果、失败原因、配置差异、回滚信息。
+        跨重启后仍可查询（数据持久化在审计日志中）。
+        """
+        conn = self._conn()
+        try:
+            batch = db.get_batch(conn, batch_id)
+            if not batch:
+                raise BatchServiceError(f"批次不存在: {batch_id}")
+
+            latest_log = db.get_latest_scheme_audit_log(conn, batch_id, exclude_dry_run=True)
+            if not latest_log:
+                return {
+                    "batch_id": batch_id,
+                    "batch_name": batch["name"],
+                    "batch_status": batch["status"],
+                    "batch_locked": bool(batch["locked"]),
+                    "current_scheme_id": batch.get("current_scheme_id"),
+                    "current_scheme_name": batch.get("current_scheme_name"),
+                    "current_config_version": batch["config_version"],
+                    "latest_change": None,
+                    "message": "该批次尚无方案变更记录"
+                }
+
+            scheme_info = {}
+            if latest_log.get("scheme_id"):
+                scheme = db.get_scheme(conn, latest_log["scheme_id"])
+                if scheme:
+                    scheme_info = {
+                        "scheme_id": scheme["id"],
+                        "scheme_name": scheme["name"],
+                        "scheme_version": scheme["scheme_version"],
+                        "source_scheme_id": scheme.get("source_scheme_id"),
+                        "original_id": scheme.get("original_id"),
+                        "imported_from": scheme.get("imported_from"),
+                    }
+
+            rollback_info = None
+            if latest_log["action"] == db.AUDIT_ACTION_ROLLBACK:
+                latest_history = db.get_latest_scheme_history(conn, batch_id)
+                if latest_history and latest_history.get("rolled_back_from_id"):
+                    rollback_info = {
+                        "rolled_back_from_history_id": latest_history["rolled_back_from_id"],
+                        "rolled_back_to_scheme_id": latest_history.get("scheme_id"),
+                        "rolled_back_to_scheme_name": latest_history.get("scheme_name"),
+                    }
+
+            version_change = None
+            config_diff = latest_log.get("config_diff")
+            if config_diff and config_diff.get("version_change"):
+                version_change = config_diff["version_change"]
+
+            return {
+                "batch_id": batch_id,
+                "batch_name": batch["name"],
+                "batch_status": batch["status"],
+                "batch_locked": bool(batch["locked"]),
+                "current_scheme_id": batch.get("current_scheme_id"),
+                "current_scheme_name": batch.get("current_scheme_name"),
+                "current_config_version": batch["config_version"],
+                "latest_change": {
+                    "audit_id": latest_log["id"],
+                    "action": latest_log["action"],
+                    "trigger_method": latest_log["trigger_method"],
+                    "result": latest_log["result"],
+                    "error_message": latest_log.get("error_message"),
+                    "scheme_id": latest_log.get("scheme_id"),
+                    "scheme_name": latest_log.get("scheme_name"),
+                    "source_scheme_id": latest_log.get("source_scheme_id"),
+                    "version_change": version_change,
+                    "config_diff": config_diff,
+                    "created_at": latest_log["created_at"],
+                },
+                "scheme_detail": scheme_info or None,
+                "rollback_info": rollback_info,
+                "message": None
+            }
+        finally:
+            conn.close()

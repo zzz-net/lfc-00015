@@ -2659,6 +2659,388 @@ def run_tests():
             r52.fail(str(e))
             print(f"  [FAIL] {r52.name}: {e}")
 
+        # ====== 测试 53: 导入冲突追溯（rename 落地后 original_name/final_name/original_id/imported_from 齐全） ======
+        r53 = TestResult("测试53: 导入 rename 冲突后追溯字段齐全（original_name/final_name/original_id/imported_from）")
+        results.append(r53)
+        try:
+            svc_imp1 = PipelineService(db_path)
+
+            imp1_bid = svc_imp1.create_batch("imp1_batch", SAMPLE_CSV)
+            svc_imp1.process_batch(imp1_bid)
+            imp1_sid = svc_imp1.save_scheme("imp1_scheme", batch_id=imp1_bid, description="导入追溯源")
+
+            imp1_dir = os.path.join(tmpdir, "imp1_exports")
+            os.makedirs(imp1_dir, exist_ok=True)
+            imp1_path = os.path.join(imp1_dir, "imp1_scheme.json")
+            svc_imp1.export_scheme_to_file(imp1_sid, imp1_path)
+
+            res_rename = svc_imp1.import_scheme_from_file(
+                imp1_path, on_conflict=SchemeImportResult.ACTION_RENAME,
+                new_name="imp1_renamed")
+            assert res_rename.success
+            assert res_rename.action == SchemeImportResult.ACTION_RENAME
+            assert res_rename.original_name == "imp1_scheme"
+            assert res_rename.final_name == "imp1_renamed"
+            assert res_rename.original_id == imp1_sid
+            assert res_rename.imported_from is not None
+            assert "imp1_scheme.json" in res_rename.imported_from or "imp1_exports" in res_rename.imported_from
+
+            imported_scheme = svc_imp1.get_scheme(res_rename.scheme_id)
+            assert imported_scheme["name"] == "imp1_renamed"
+            assert imported_scheme["original_id"] == imp1_sid
+            assert imported_scheme["imported_from"] is not None
+
+            res_overwrite = svc_imp1.import_scheme_from_file(
+                imp1_path, on_conflict=SchemeImportResult.ACTION_OVERWRITE)
+            assert res_overwrite.success
+            assert res_overwrite.original_name == "imp1_scheme"
+            assert res_overwrite.final_name == "imp1_scheme"
+            assert res_overwrite.original_id == imp1_sid
+
+            res_skip = svc_imp1.import_scheme_from_file(
+                imp1_path, on_conflict=SchemeImportResult.ACTION_SKIP)
+            assert not res_skip.success
+            assert res_skip.original_name == "imp1_scheme"
+            assert res_skip.final_name is None
+            assert res_skip.original_id == imp1_sid
+
+            import_audit = svc_imp1.get_scheme_audit_logs(action="import")
+            assert len(import_audit) >= 3, f"导入操作应记录审计日志，实际 {len(import_audit)} 条"
+            for al in import_audit:
+                assert al["action"] == "import"
+                assert al["trigger_method"] == "import"
+
+            r53.ok()
+            print(f"  [PASS] {r53.name}  (rename/overwrite/skip 追溯字段+审计日志齐全)")
+        except Exception as e:
+            r53.fail(str(e))
+            print(f"  [FAIL] {r53.name}: {e}")
+
+        # ====== 测试 54: 导入后跨重启查询（方案和审计日志持久化） ======
+        r54 = TestResult("测试54: 导入方案后跨重启查询，方案/审计日志/original_id 保留")
+        results.append(r54)
+        try:
+            svc_pre = PipelineService(db_path)
+
+            pre_imp_bid = svc_pre.create_batch("pre_imp_batch", SAMPLE_CSV)
+            svc_pre.process_batch(pre_imp_bid)
+            pre_imp_sid = svc_pre.save_scheme("pre_imp_scheme", batch_id=pre_imp_bid)
+
+            pre_imp_dir = os.path.join(tmpdir, "pre_imp_exports")
+            os.makedirs(pre_imp_dir, exist_ok=True)
+            pre_imp_path = os.path.join(pre_imp_dir, "pre_imp.json")
+            svc_pre.export_scheme_to_file(pre_imp_sid, pre_imp_path)
+
+            res = svc_pre.import_scheme_from_file(
+                pre_imp_path, on_conflict=SchemeImportResult.ACTION_RENAME,
+                new_name="pre_imp_imported")
+            assert res.success
+            imported_id = res.scheme_id
+
+            pre_audit = svc_pre.get_scheme_audit_logs(action="import")
+
+            del svc_pre
+
+            svc_post = PipelineService(db_path)
+
+            post_scheme = svc_post.get_scheme(imported_id)
+            assert post_scheme is not None, "重启后导入方案应存在"
+            assert post_scheme["name"] == "pre_imp_imported"
+            assert post_scheme["original_id"] == pre_imp_sid
+            assert post_scheme["imported_from"] is not None
+
+            post_audit = svc_post.get_scheme_audit_logs(action="import")
+            assert len(post_audit) == len(pre_audit), "重启后导入审计日志数量应不变"
+
+            r54.ok()
+            print(f"  [PASS] {r54.name}  (imported_id={imported_id}, original_id={pre_imp_sid})")
+        except Exception as e:
+            r54.fail(str(e))
+            print(f"  [FAIL] {r54.name}: {e}")
+
+        # ====== 测试 55: import_and_apply_scheme 一步链路 ======
+        r55 = TestResult("测试55: import_and_apply_scheme 一步导入并应用，审计日志含 import_apply")
+        results.append(r55)
+        try:
+            svc_ia = PipelineService(db_path)
+
+            ia_src_bid = svc_ia.create_batch("ia_src_batch", SAMPLE_CSV)
+            svc_ia.process_batch(ia_src_bid)
+            ia_src_sid = svc_ia.save_scheme("ia_source", batch_id=ia_src_bid, description="导入应用源")
+
+            ia_dir = os.path.join(tmpdir, "ia_exports")
+            os.makedirs(ia_dir, exist_ok=True)
+            ia_path = os.path.join(ia_dir, "ia_source.json")
+            svc_ia.export_scheme_to_file(ia_src_sid, ia_path)
+
+            with open(ia_path, "r", encoding="utf-8") as f:
+                exported = json.load(f)
+            exported["config"]["anomaly_detection"]["zscore_threshold"] = 0.8
+            modified_path = os.path.join(ia_dir, "ia_modified.json")
+            with open(modified_path, "w", encoding="utf-8") as f:
+                json.dump(exported, f, ensure_ascii=False)
+
+            ia_target_bid = svc_ia.create_batch("ia_target_batch", SAMPLE_CSV)
+            svc_ia.process_batch(ia_target_bid)
+
+            result = svc_ia.import_and_apply_scheme(modified_path, ia_target_bid,
+                                                     on_conflict=SchemeImportResult.ACTION_RENAME,
+                                                     new_name="ia_imported_applied")
+            assert result["import_result"].success
+            assert result["apply_config"] is not None
+            assert result["import_result"].final_name == "ia_imported_applied"
+            assert result["import_result"].original_name == "ia_source"
+
+            batch_after = svc_ia.get_batch(ia_target_bid)
+            assert batch_after["current_scheme_id"] == result["import_result"].scheme_id
+            assert batch_after["current_scheme_name"] == "ia_imported_applied"
+            cfg_after = json.loads(batch_after["config_json"])
+            assert cfg_after["anomaly_detection"]["zscore_threshold"] == 0.8
+
+            ia_audit = svc_ia.get_scheme_audit_logs(batch_id=ia_target_bid, action="import_apply")
+            assert len(ia_audit) >= 1, "import_and_apply 应记录 import_apply 审计日志"
+            ia_al = ia_audit[0]
+            assert ia_al["action"] == "import_apply"
+            assert ia_al["result"] == "success"
+            assert ia_al["trigger_method"] == "import"
+            assert ia_al["scheme_id"] == result["import_result"].scheme_id
+            assert ia_al["config_diff"] is not None
+
+            r55.ok()
+            print(f"  [PASS] {r55.name}  (scheme_id={result['import_result'].scheme_id}, cfg_v={cfg_after['version']})")
+        except Exception as e:
+            r55.fail(str(e))
+            print(f"  [FAIL] {r55.name}: {e}")
+
+        # ====== 测试 56: 导入应用后回滚，再继续处理 ======
+        r56 = TestResult("测试56: 导入应用后回滚成功，回滚后继续 process 正常，审计历史连续")
+        results.append(r56)
+        try:
+            svc_iar = PipelineService(db_path)
+
+            iar_src_bid = svc_iar.create_batch("iar_src", SAMPLE_CSV)
+            svc_iar.process_batch(iar_src_bid)
+            iar_src_sid = svc_iar.save_scheme("iar_source", batch_id=iar_src_bid)
+
+            iar_dir = os.path.join(tmpdir, "iar_exports")
+            os.makedirs(iar_dir, exist_ok=True)
+            iar_path = os.path.join(iar_dir, "iar_source.json")
+            svc_iar.export_scheme_to_file(iar_src_sid, iar_path)
+
+            with open(iar_path, "r", encoding="utf-8") as f:
+                iar_data = json.load(f)
+            iar_data["config"]["anomaly_detection"]["zscore_threshold"] = 0.3
+            iar_mod_path = os.path.join(iar_dir, "iar_modified.json")
+            with open(iar_mod_path, "w", encoding="utf-8") as f:
+                json.dump(iar_data, f, ensure_ascii=False)
+
+            iar_target_bid = svc_iar.create_batch("iar_target", SAMPLE_CSV)
+            svc_iar.process_batch(iar_target_bid)
+            cfg_before = json.loads(svc_iar.get_batch(iar_target_bid)["config_json"])
+            threshold_before = cfg_before["anomaly_detection"]["zscore_threshold"]
+
+            result = svc_iar.import_and_apply_scheme(iar_mod_path, iar_target_bid,
+                                                      on_conflict=SchemeImportResult.ACTION_RENAME,
+                                                      new_name="iar_imported")
+            assert result["import_result"].success
+            cfg_after_import = json.loads(svc_iar.get_batch(iar_target_bid)["config_json"])
+            assert cfg_after_import["anomaly_detection"]["zscore_threshold"] == 0.3
+
+            rb_result = svc_iar.rollback_scheme(iar_target_bid)
+            assert rb_result.success
+
+            cfg_after_rb = json.loads(svc_iar.get_batch(iar_target_bid)["config_json"])
+            assert cfg_after_rb["anomaly_detection"]["zscore_threshold"] == threshold_before, \
+                f"回滚后阈值应恢复到 {threshold_before}，实际 {cfg_after_rb['anomaly_detection']['zscore_threshold']}"
+
+            run_id, run_n = svc_iar.process_batch(iar_target_bid)
+            assert run_n >= 2, "回滚后 process 应正常执行"
+
+            all_audit = svc_iar.get_scheme_audit_logs(batch_id=iar_target_bid)
+            non_dry = [a for a in all_audit if a["action"] != "dry_run"]
+            actions = [a["action"] for a in non_dry]
+            assert "import_apply" in actions, "审计历史应包含 import_apply"
+            assert "rollback" in actions, "审计历史应包含 rollback"
+
+            r56.ok()
+            print(f"  [PASS] {r56.name}  (rollback_ok, process_after_rb=run#{run_n})")
+        except Exception as e:
+            r56.fail(str(e))
+            print(f"  [FAIL] {r56.name}: {e}")
+
+        # ====== 测试 57: get_latest_scheme_change 快查 ======
+        r57 = TestResult("测试57: get_latest_scheme_change 返回最近变更详情，跨重启保留")
+        results.append(r57)
+        try:
+            svc_lc = PipelineService(db_path)
+
+            lc_bid = svc_lc.create_batch("lc_batch", SAMPLE_CSV)
+            svc_lc.process_batch(lc_bid)
+
+            lc_no_change = svc_lc.get_latest_scheme_change(lc_bid)
+            assert lc_no_change["batch_id"] == lc_bid
+            assert lc_no_change["latest_change"] is None
+
+            lc_sid = svc_lc.save_scheme("lc_scheme", batch_id=lc_bid, description="变更测试")
+            svc_lc.apply_scheme_to_batch(lc_sid, lc_bid)
+
+            lc_after_apply = svc_lc.get_latest_scheme_change(lc_bid)
+            assert lc_after_apply["latest_change"] is not None
+            lc_info = lc_after_apply["latest_change"]
+            assert lc_info["action"] == "apply"
+            assert lc_info["result"] == "success"
+            assert lc_info["scheme_id"] == lc_sid
+            assert lc_info["version_change"] is not None
+            assert lc_info["trigger_method"] == "cli"
+
+            assert lc_after_apply["scheme_detail"] is not None
+            sd = lc_after_apply["scheme_detail"]
+            assert sd["scheme_id"] == lc_sid
+            assert sd["scheme_name"] == "lc_scheme"
+
+            svc_lc.set_threshold(lc_bid, zscore_threshold=1.2)
+
+            lc_after_thresh = svc_lc.get_latest_scheme_change(lc_bid)
+            assert lc_after_thresh["latest_change"]["action"] == "direct_modify"
+
+            svc_lc.rollback_scheme(lc_bid)
+            lc_after_rb = svc_lc.get_latest_scheme_change(lc_bid)
+            assert lc_after_rb["latest_change"]["action"] == "rollback"
+            assert lc_after_rb["rollback_info"] is not None
+            assert lc_after_rb["rollback_info"]["rolled_back_to_scheme_id"] == lc_sid
+
+            del svc_lc
+            svc_lc2 = PipelineService(db_path)
+            lc_restart = svc_lc2.get_latest_scheme_change(lc_bid)
+            assert lc_restart["latest_change"]["action"] == "rollback"
+            assert lc_restart["latest_change"]["version_change"] is not None
+
+            r57.ok()
+            print(f"  [PASS] {r57.name}  (no_change/apply/threshold/rollback/restart 全通过)")
+        except Exception as e:
+            r57.fail(str(e))
+            print(f"  [FAIL] {r57.name}: {e}")
+
+        # ====== 测试 58: CLI scheme import-apply / last-change 命令 ======
+        r58 = TestResult("测试58: CLI scheme import-apply / last-change 命令输出完整")
+        results.append(r58)
+        try:
+            from click.testing import CliRunner
+            from pipeline.cli import cli
+
+            runner = CliRunner()
+            svc_cli = PipelineService(db_path)
+
+            cli_imp_bid = svc_cli.create_batch("cli_imp_batch", SAMPLE_CSV)
+            svc_cli.process_batch(cli_imp_bid)
+            cli_imp_sid = svc_cli.save_scheme("cli_imp_scheme", batch_id=cli_imp_bid, description="CLI导入应用源")
+
+            cli_imp_dir = os.path.join(tmpdir, "cli_imp_exports")
+            os.makedirs(cli_imp_dir, exist_ok=True)
+            cli_imp_path = os.path.join(cli_imp_dir, "cli_imp.json")
+            svc_cli.export_scheme_to_file(cli_imp_sid, cli_imp_path)
+
+            cli_imp_target = svc_cli.create_batch("cli_imp_target", SAMPLE_CSV)
+            svc_cli.process_batch(cli_imp_target)
+
+            res_imp_apply = runner.invoke(cli, ["--db", db_path, "scheme", "import-apply",
+                                                 cli_imp_path, str(cli_imp_target),
+                                                 "--on-conflict", "rename",
+                                                 "--new-name", "cli_imported_applied"])
+            assert res_imp_apply.exit_code == 0, f"import-apply 应成功，output={res_imp_apply.output}"
+            assert "[OK]" in res_imp_apply.output
+            assert "方案导入并应用成功" in res_imp_apply.output
+            assert "方案ID" in res_imp_apply.output
+            assert "配置版本" in res_imp_apply.output
+
+            res_last_change = runner.invoke(cli, ["--db", db_path, "scheme", "last-change",
+                                                   str(cli_imp_target)])
+            assert res_last_change.exit_code == 0, f"last-change 应成功，output={res_last_change.output}"
+            assert "方案变更结果" in res_last_change.output
+            assert "最近一次变更" in res_last_change.output
+            assert "导入应用" in res_last_change.output or "import_apply" in res_last_change.output.lower()
+            assert "版本变化" in res_last_change.output
+            assert "成功" in res_last_change.output
+
+            res_last_change_no = runner.invoke(cli, ["--db", db_path, "scheme", "last-change",
+                                                      str(cli_imp_bid)])
+            assert res_last_change_no.exit_code == 0
+            assert "尚无方案变更记录" in res_last_change_no.output or "方案变更结果" in res_last_change_no.output
+
+            res_help = runner.invoke(cli, ["scheme", "--help"])
+            assert "import-apply" in res_help.output
+            assert "last-change" in res_help.output
+
+            res_ia_help = runner.invoke(cli, ["scheme", "import-apply", "--help"])
+            assert res_ia_help.exit_code == 0
+            assert "FILE_PATH" in res_ia_help.output
+            assert "BATCH_ID" in res_ia_help.output
+            assert "on-conflict" in res_ia_help.output
+
+            res_lc_help = runner.invoke(cli, ["scheme", "last-change", "--help"])
+            assert res_lc_help.exit_code == 0
+            assert "BATCH_ID" in res_lc_help.output
+
+            r58.ok()
+            print(f"  [PASS] {r58.name}  (import-apply + last-change CLI 输出完整)")
+        except Exception as e:
+            r58.fail(str(e))
+            print(f"  [FAIL] {r58.name}: {e}")
+
+        # ====== 测试 59: 导入应用后 switch/rollback 链路完整 + 审计历史连续 ======
+        r59 = TestResult("测试59: 导入应用后用 switch rollback 回滚，再继续 process，审计历史不断")
+        results.append(r59)
+        try:
+            svc_chain = PipelineService(db_path)
+
+            ch_src_bid = svc_chain.create_batch("ch_src", SAMPLE_CSV)
+            svc_chain.process_batch(ch_src_bid)
+            ch_src_sid = svc_chain.save_scheme("ch_source", batch_id=ch_src_bid, description="链路源")
+
+            ch_dir = os.path.join(tmpdir, "ch_exports")
+            os.makedirs(ch_dir, exist_ok=True)
+            ch_path = os.path.join(ch_dir, "ch_source.json")
+            svc_chain.export_scheme_to_file(ch_src_sid, ch_path)
+
+            ch_target_bid = svc_chain.create_batch("ch_target", SAMPLE_CSV)
+            svc_chain.process_batch(ch_target_bid)
+
+            ch_result = svc_chain.import_and_apply_scheme(ch_path, ch_target_bid,
+                                                           on_conflict=SchemeImportResult.ACTION_RENAME,
+                                                           new_name="ch_imported")
+            assert ch_result["import_result"].success
+
+            ch_batch_before = svc_chain.get_batch(ch_target_bid)
+            assert ch_batch_before["current_scheme_id"] == ch_result["import_result"].scheme_id
+
+            sw_result = svc_chain.switch_scheme(
+                SwitchSchemeResult.SWITCH_TYPE_ROLLBACK, ch_target_bid)
+            assert sw_result.success
+            assert sw_result.rollback_result is not None
+            assert sw_result.rollback_result.success
+
+            ch_batch_after = svc_chain.get_batch(ch_target_bid)
+            assert ch_batch_after["current_scheme_id"] != ch_result["import_result"].scheme_id
+
+            ch_run_id, ch_run_n = svc_chain.process_batch(ch_target_bid)
+            assert ch_run_n >= 2
+
+            all_audit = svc_chain.get_scheme_audit_logs(batch_id=ch_target_bid)
+            non_dry = [a for a in all_audit if a["action"] != "dry_run"]
+            actions = [a["action"] for a in non_dry]
+            assert "import_apply" in actions
+            assert "rollback" in actions
+
+            lc = svc_chain.get_latest_scheme_change(ch_target_bid)
+            assert lc["latest_change"]["action"] == "rollback"
+            assert lc["rollback_info"] is not None
+
+            r59.ok()
+            print(f"  [PASS] {r59.name}  (import_apply→switch_rollback→process→audit 连续)")
+        except Exception as e:
+            r59.fail(str(e))
+            print(f"  [FAIL] {r59.name}: {e}")
+
         # ====== 汇总 ======
         print()
         total = len(results)

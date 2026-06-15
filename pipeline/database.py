@@ -148,7 +148,7 @@ def init_db(db_path: str = None) -> None:
 
             CREATE TABLE IF NOT EXISTS scheme_audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                batch_id INTEGER NOT NULL,
+                batch_id INTEGER,
                 scheme_id INTEGER,
                 scheme_name TEXT,
                 source_scheme_id INTEGER,
@@ -160,7 +160,6 @@ def init_db(db_path: str = None) -> None:
                 result TEXT NOT NULL,
                 error_message TEXT,
                 created_at TEXT NOT NULL,
-                FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE,
                 FOREIGN KEY (scheme_id) REFERENCES analysis_schemes(id) ON DELETE SET NULL
             );
 
@@ -189,6 +188,38 @@ def init_db(db_path: str = None) -> None:
             cursor.execute(
                 "ALTER TABLE analysis_schemes ADD COLUMN imported_from TEXT"
             )
+            conn.commit()
+
+        cursor.execute("PRAGMA table_info(scheme_audit_log)")
+        sal_cols = {col[1]: col[3] for col in cursor.fetchall()}
+        if sal_cols.get("batch_id") == 1:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scheme_audit_log_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER,
+                    scheme_id INTEGER,
+                    scheme_name TEXT,
+                    source_scheme_id INTEGER,
+                    action TEXT NOT NULL,
+                    trigger_method TEXT NOT NULL,
+                    previous_config_json TEXT,
+                    new_config_json TEXT,
+                    config_diff_json TEXT,
+                    result TEXT NOT NULL,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (scheme_id) REFERENCES analysis_schemes(id) ON DELETE SET NULL
+                )
+            """)
+            existing_cols = [col[1] for col in cursor.execute("PRAGMA table_info(scheme_audit_log)").fetchall()]
+            col_list = ", ".join(existing_cols)
+            cursor.execute(f"INSERT INTO scheme_audit_log_new ({col_list}) SELECT {col_list} FROM scheme_audit_log")
+            cursor.execute("DROP TABLE scheme_audit_log")
+            cursor.execute("ALTER TABLE scheme_audit_log_new RENAME TO scheme_audit_log")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_batch_id ON scheme_audit_log(batch_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_scheme_id ON scheme_audit_log(scheme_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_action ON scheme_audit_log(action)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheme_audit_log_result ON scheme_audit_log(result)")
             conn.commit()
 
         cursor.execute("PRAGMA table_info(batches)")
@@ -726,6 +757,8 @@ def get_scheme_history_by_id(conn: sqlite3.Connection, history_id: int) -> Optio
 AUDIT_ACTION_APPLY = "apply"
 AUDIT_ACTION_CLONE_APPLY = "clone_apply"
 AUDIT_ACTION_DERIVE_APPLY = "derive_apply"
+AUDIT_ACTION_IMPORT = "import"
+AUDIT_ACTION_IMPORT_APPLY = "import_apply"
 AUDIT_ACTION_ROLLBACK = "rollback"
 AUDIT_ACTION_DIRECT_MODIFY = "direct_modify"
 AUDIT_ACTION_DRY_RUN = "dry_run"
@@ -741,10 +774,10 @@ AUDIT_TRIGGER_IMPORT = "import"
 
 def add_scheme_audit_log(
     conn: sqlite3.Connection,
-    batch_id: int,
-    action: str,
-    trigger_method: str,
-    result: str,
+    batch_id: int = None,
+    action: str = None,
+    trigger_method: str = None,
+    result: str = None,
     scheme_id: int = None,
     scheme_name: str = None,
     source_scheme_id: int = None,
@@ -753,13 +786,14 @@ def add_scheme_audit_log(
     config_diff: Dict[str, Any] = None,
     error_message: str = None
 ) -> int:
-    """添加方案审计日志，返回日志 ID"""
+    """添加方案审计日志，返回日志 ID。batch_id 为 None 时跳过批次校验（用于导入等无目标批次场景）"""
     now = datetime.now().isoformat()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id FROM batches WHERE id = ?", (batch_id,))
-    if not cursor.fetchone():
-        return 0
+    if batch_id is not None:
+        cursor.execute("SELECT id FROM batches WHERE id = ?", (batch_id,))
+        if not cursor.fetchone():
+            return 0
 
     if scheme_id is not None:
         cursor.execute("SELECT id FROM analysis_schemes WHERE id = ?", (scheme_id,))
@@ -826,6 +860,42 @@ def get_scheme_audit_logs(conn: sqlite3.Connection, batch_id: int = None, scheme
             del r["config_diff_json"]
         results.append(r)
     return results
+
+
+def get_latest_scheme_audit_log(conn: sqlite3.Connection, batch_id: int,
+                                exclude_dry_run: bool = True) -> Optional[Dict[str, Any]]:
+    """获取批次最近一条审计日志（默认排除 dry_run），用于 last-change 快查"""
+    cursor = conn.cursor()
+    if exclude_dry_run:
+        cursor.execute("""
+            SELECT * FROM scheme_audit_log
+            WHERE batch_id = ? AND action != ? ORDER BY id DESC LIMIT 1
+        """, (batch_id, AUDIT_ACTION_DRY_RUN))
+    else:
+        cursor.execute("""
+            SELECT * FROM scheme_audit_log
+            WHERE batch_id = ? ORDER BY id DESC LIMIT 1
+        """, (batch_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    r = dict(row)
+    if r.get("previous_config_json"):
+        r["previous_config"] = json.loads(r["previous_config_json"])
+        del r["previous_config_json"]
+    else:
+        del r["previous_config_json"]
+    if r.get("new_config_json"):
+        r["new_config"] = json.loads(r["new_config_json"])
+        del r["new_config_json"]
+    else:
+        del r["new_config_json"]
+    if r.get("config_diff_json"):
+        r["config_diff"] = json.loads(r["config_diff_json"])
+        del r["config_diff_json"]
+    else:
+        del r["config_diff_json"]
+    return r
 
 
 def compute_config_diff(previous_config: Dict[str, Any], new_config: Dict[str, Any]) -> Dict[str, Any]:
